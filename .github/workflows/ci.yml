@@ -41,6 +41,21 @@ jobs:
             exit 1
           fi
 
+      - name: no source file is gitignored
+        # A bare pattern in .gitignore matches that name at any depth, so an
+        # entry meant for a root-level build artifact can silently exclude a
+        # whole source directory. That happened: "api" and "worker" excluded
+        # cmd/api and cmd/worker, which built locally and were absent from the
+        # repository. This is the cheap guard against the entire class.
+        run: |
+          hidden=$(git ls-files --others --ignored --exclude-standard -- '*.go' '*.sql')
+          if [ -n "$hidden" ]; then
+            echo "these source files are excluded by .gitignore and are not in the repo:"
+            echo "$hidden"
+            exit 1
+          fi
+          echo "no source files are gitignored"
+
       - name: go vet
         run: go vet ./...
 
