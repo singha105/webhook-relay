@@ -24,6 +24,7 @@ const (
 	CodeInternal         ErrorCode = "internal_error"
 	CodeMethodNotAllowed ErrorCode = "method_not_allowed"
 	CodePayloadTooLarge  ErrorCode = "payload_too_large"
+	CodeNotReplayable    ErrorCode = "not_replayable"
 )
 
 // ErrorBody is the single error shape every failure uses. One shape means a

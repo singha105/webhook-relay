@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/singha105/webhook-relay/internal/queue"
 	"github.com/singha105/webhook-relay/internal/store"
 )
 
@@ -23,6 +24,12 @@ type Server struct {
 	store  *store.Store
 	logger *slog.Logger
 	cfg    ServerConfig
+
+	// queue is optional. When present, a replayed event is pushed straight to
+	// the stream so an operator watching does not wait out a relay poll. When
+	// absent — which is the API's default deployment — the relay picks the
+	// event up on its next tick, so replay still works, just a beat later.
+	queue queue.Queue
 }
 
 // ServerConfig is the subset of configuration the HTTP layer needs.
@@ -33,6 +40,12 @@ type ServerConfig struct {
 // NewServer builds a Server.
 func NewServer(st *store.Store, logger *slog.Logger, cfg ServerConfig) *Server {
 	return &Server{store: st, logger: logger, cfg: cfg}
+}
+
+// WithQueue attaches a queue so replays are enqueued immediately.
+func (s *Server) WithQueue(q queue.Queue) *Server {
+	s.queue = q
+	return s
 }
 
 // Routes returns the fully wired handler.
@@ -78,6 +91,7 @@ func (s *Server) Routes() http.Handler {
 		r.Route("/events", func(r chi.Router) {
 			r.Post("/", s.ingestEvent)
 			r.Get("/{id}", s.getEvent)
+			r.Post("/{id}/replay", s.replayEvent)
 		})
 	})
 

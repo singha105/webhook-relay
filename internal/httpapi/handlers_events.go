@@ -88,6 +88,60 @@ func (s *Server) ingestEvent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, r, http.StatusAccepted, event)
 }
 
+// replayEvent handles POST /v1/events/{id}/replay.
+//
+// Returns a dead-lettered or already-delivered event to the ready set with a
+// fresh attempt budget. The attempt history is deliberately kept: a replay is a
+// new run of delivery, not a rewriting of what happened, and the operator
+// investigating the original failure needs those rows. New attempts continue
+// the numbering from where the old ones stopped.
+//
+// Only terminal states are replayable. Replaying an event that is mid-flight
+// would race the worker holding it and could produce two live delivery chains
+// for one event, which is exactly the duplicate the rest of the system works to
+// avoid.
+func (s *Server) replayEvent(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseIDParam(w, r)
+	if !ok {
+		return
+	}
+
+	event, err := s.store.ReplayEvent(r.Context(), id)
+	if err != nil {
+		switch {
+		case errors.Is(err, models.ErrNotReplayable):
+			// 409, not 404: the event exists, its current state just does not
+			// permit this transition. A 404 would send an operator hunting for
+			// an id that is right there.
+			writeError(w, r, http.StatusConflict, CodeNotReplayable,
+				"only events in the dlq or delivered state can be replayed")
+		case errors.Is(err, models.ErrNotFound):
+			writeError(w, r, http.StatusNotFound, CodeNotFound, "event not found")
+		default:
+			writeInternalError(w, r, err, "replay_event")
+		}
+		return
+	}
+
+	log := LoggerFrom(r.Context()).With(
+		slog.String("event_id", event.ID.String()),
+		slog.String("endpoint_id", event.EndpointID.String()),
+	)
+
+	// Best effort: push it straight to the stream so an operator watching sees
+	// it move immediately. If this fails the relay still picks it up on its
+	// next poll, so the failure is logged and not returned.
+	if s.queue != nil {
+		if err := s.queue.Enqueue(r.Context(), event.ID); err != nil {
+			log.Warn("replay enqueued via the relay instead of directly",
+				slog.Any("error", err))
+		}
+	}
+
+	log.Info("event replayed; attempt budget reset")
+	writeJSON(w, r, http.StatusAccepted, event)
+}
+
 // getEvent handles GET /v1/events/{id}, returning status plus attempt history.
 func (s *Server) getEvent(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseIDParam(w, r)

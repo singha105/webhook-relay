@@ -72,11 +72,61 @@ services:
       valkey:
         condition: service_healthy
     healthcheck:
-      # The distroless image has no shell and no curl, so the binary checks
-      # itself. Day 1 has no such flag, so this probes from the host side via
-      # the Makefile instead. Left explicitly disabled rather than silently
-      # absent, so the reason is visible.
-      disable: true
+      # The distroless image has no shell and no curl, so the binary probes
+      # itself: `api -healthcheck` GETs its own /readyz and exits 0 or 1. That
+      # also means the check cannot drift from the code it is checking.
+      test: ["CMD", "/app", "-healthcheck"]
+      interval: 5s
+      timeout: 4s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # Delivery worker: the outbox relay and the delivery pool in one process.
+  # They are colocated because a deployment missing either is silently broken —
+  # events enqueued and never delivered, or workers with nothing feeding them.
+  worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        TARGET: worker
+    environment:
+      DATABASE_URL: "postgres://webhook_relay:webhook_relay@postgres:5432/webhook_relay?sslmode=disable"
+      VALKEY_URL: "redis://valkey:6379"
+      LOG_LEVEL: "info"
+      WORKER_CONCURRENCY: "${WORKER_CONCURRENCY:-10}"
+      MAX_ATTEMPTS: "${MAX_ATTEMPTS:-6}"
+      RETRY_BASE_DELAY: "${RETRY_BASE_DELAY:-1s}"
+      RETRY_MAX_DELAY: "${RETRY_MAX_DELAY:-1h}"
+      DELIVERY_TIMEOUT: "${DELIVERY_TIMEOUT:-10s}"
+      # Exposed as an override because Day 5 turns it off on purpose to
+      # demonstrate the duplicate deliveries it prevents.
+      DELIVERY_DEDUP_ENABLED: "${DELIVERY_DEDUP_ENABLED:-true}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      # The worker serves no HTTP, so it checks what it actually needs: that
+      # Postgres and Valkey are both reachable with its real configuration.
+      test: ["CMD", "/app", "-healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # Controllable webhook receiver, for the Day 2 verification. It is a test
+  # fixture, so it sits behind a profile and does not start with the stack.
+  sink:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.sink
+    profiles: ["demo"]
+    ports:
+      - "${SINK_PORT:-9090}:9090"
     restart: unless-stopped
 
   # Applies migrations, then exits. Kept behind a profile so `docker compose up`

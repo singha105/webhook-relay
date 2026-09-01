@@ -61,6 +61,16 @@ type Event struct {
 
 	Status EventStatus `json:"status"`
 
+	// AttemptCount is how many delivery attempts have been made. Denormalized
+	// from delivery_attempts so the relay's polling query does not need a
+	// correlated subquery per candidate row.
+	AttemptCount int `json:"attempt_count"`
+
+	// NextRetryAt is the earliest time this event may be delivered. While the
+	// event is in 'delivering' it is instead a lease expiry: the time after
+	// which the worker holding it is presumed dead.
+	NextRetryAt time.Time `json:"next_retry_at"`
+
 	// IdempotencyKey is nil when the caller did not send one. Uniqueness is
 	// scoped per endpoint, not globally, so two tenants can independently use
 	// the key "order-123".

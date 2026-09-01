@@ -181,7 +181,7 @@ func TestGetEventWithAttempts(t *testing.T) {
 // Exercises the partial index events (endpoint_id, created_at) WHERE
 // status='pending' — both that it returns oldest-first and that a delivered
 // event drops out of the result set.
-func TestListPendingEventsForEndpoint(t *testing.T) {
+func TestListDueEventsForEndpoint(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := test.NewStore(t)
@@ -196,9 +196,9 @@ func TestListPendingEventsForEndpoint(t *testing.T) {
 		ids = append(ids, ev.ID.String())
 	}
 
-	got, err := s.ListPendingEventsForEndpoint(ctx, e.ID, 10)
+	got, err := s.ListDueEventsForEndpoint(ctx, e.ID, 10)
 	if err != nil {
-		t.Fatalf("ListPendingEventsForEndpoint() = %v", err)
+		t.Fatalf("ListDueEventsForEndpoint() = %v", err)
 	}
 	if len(got) != 5 {
 		t.Fatalf("len = %d, want 5", len(got))
@@ -210,25 +210,45 @@ func TestListPendingEventsForEndpoint(t *testing.T) {
 	}
 
 	t.Run("limit is honoured", func(t *testing.T) {
-		limited, err := s.ListPendingEventsForEndpoint(ctx, e.ID, 2)
+		limited, err := s.ListDueEventsForEndpoint(ctx, e.ID, 2)
 		if err != nil {
-			t.Fatalf("ListPendingEventsForEndpoint() = %v", err)
+			t.Fatalf("ListDueEventsForEndpoint() = %v", err)
 		}
 		if len(limited) != 2 {
 			t.Errorf("len = %d, want 2", len(limited))
 		}
 	})
 
-	t.Run("a delivered event leaves the pending set", func(t *testing.T) {
+	t.Run("a delivered event leaves the due set", func(t *testing.T) {
 		if err := s.UpdateEventStatus(ctx, uuidMust(t, ids[0]), models.StatusDelivered); err != nil {
 			t.Fatalf("UpdateEventStatus() = %v", err)
 		}
-		after, err := s.ListPendingEventsForEndpoint(ctx, e.ID, 10)
+		after, err := s.ListDueEventsForEndpoint(ctx, e.ID, 10)
 		if err != nil {
-			t.Fatalf("ListPendingEventsForEndpoint() = %v", err)
+			t.Fatalf("ListDueEventsForEndpoint() = %v", err)
 		}
 		if len(after) != 4 {
 			t.Errorf("len = %d, want 4 after one delivery", len(after))
+		}
+	})
+
+	// An event scheduled for a future retry is not yet due, even though it is
+	// in a non-terminal state. This is the property the relay depends on to
+	// respect backoff.
+	t.Run("an event scheduled in the future is not due yet", func(t *testing.T) {
+		if _, err := s.Pool().Exec(ctx,
+			`UPDATE events SET status = 'failed', next_retry_at = now() + interval '1 hour' WHERE id = $1`,
+			uuidMust(t, ids[2])); err != nil {
+			t.Fatalf("schedule future retry: %v", err)
+		}
+		after, err := s.ListDueEventsForEndpoint(ctx, e.ID, 10)
+		if err != nil {
+			t.Fatalf("ListDueEventsForEndpoint() = %v", err)
+		}
+		for _, ev := range after {
+			if ev.ID.String() == ids[2] {
+				t.Error("an event scheduled an hour out was returned as due")
+			}
 		}
 	})
 
