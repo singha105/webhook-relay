@@ -1,0 +1,11 @@
+.git
+.github
+.githooks
+docs
+deploy
+bin
+dist
+*.md
+!README.md
+.env
+.env.*

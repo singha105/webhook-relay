@@ -1,0 +1,106 @@
+# Local development stack.
+#
+# Named so the network is predictably "webhook-relay_default", which the
+# migrate service and any ad-hoc container can attach to.
+name: webhook-relay
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: webhook_relay
+      POSTGRES_PASSWORD: webhook_relay
+      POSTGRES_DB: webhook_relay
+      # Faster, safer initdb for a throwaway local database.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      # Exposed so `make test` and psql can reach it from the host.
+      # Host port is overridable: a developer machine very often already has a
+      # local Postgres on 5432.
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # -U and -d are both required: without them pg_isready checks the
+      # default "postgres" database, which reports ready before ours exists.
+      test: ["CMD-SHELL", "pg_isready -U webhook_relay -d webhook_relay"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      # Gives a cold start room to run initdb without burning retries.
+      start_period: 10s
+    restart: unless-stopped
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    # Day 1 does not use Valkey. It is here so the stack Day 2 needs comes up
+    # from the same command, and so a broken image tag is discovered now.
+    command: ["valkey-server", "--appendonly", "yes", "--save", ""]
+    ports:
+      - "${VALKEY_PORT:-6379}:6379"
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        TARGET: api
+    environment:
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: "postgres://webhook_relay:webhook_relay@postgres:5432/webhook_relay?sslmode=disable"
+      VALKEY_URL: "redis://valkey:6379"
+      LOG_LEVEL: "info"
+    ports:
+      # 8080 collides with Apache, Tomcat, and half the tools on a dev laptop,
+      # so the host side is overridable via API_PORT in .env.
+      - "${API_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        # service_healthy, not service_started: the API pings Postgres at boot
+        # and exits if it cannot connect, so starting it against a listening
+        # but not-yet-ready Postgres would crash-loop it.
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      # The distroless image has no shell and no curl, so the binary checks
+      # itself. Day 1 has no such flag, so this probes from the host side via
+      # the Makefile instead. Left explicitly disabled rather than silently
+      # absent, so the reason is visible.
+      disable: true
+    restart: unless-stopped
+
+  # Applies migrations, then exits. Kept behind a profile so `docker compose up`
+  # does not run it implicitly; `make migrate-up` invokes it by name.
+  #
+  # Uses the official golang-migrate image rather than linking the library into
+  # the app. Migrations are an operator action, not something a starting pod
+  # should do — several replicas racing to migrate on rollout is a classic way
+  # to deadlock a deploy.
+  migrate:
+    image: migrate/migrate:v4.18.1
+    profiles: ["tools"]
+    volumes:
+      - ../../migrations:/migrations:ro
+    entrypoint:
+      [
+        "migrate",
+        "-path", "/migrations",
+        "-database", "postgres://webhook_relay:webhook_relay@postgres:5432/webhook_relay?sslmode=disable",
+      ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  valkey_data:
