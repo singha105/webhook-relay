@@ -44,7 +44,7 @@ func do(t *testing.T, srv *httptest.Server, method, path string, body any, heade
 		}
 	}
 
-	req, err := http.NewRequest(method, srv.URL+path, reader)
+	req, err := http.NewRequestWithContext(t.Context(), method, srv.URL+path, reader)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -263,7 +263,11 @@ func TestRequestIDPropagation(t *testing.T) {
 	srv := newTestServer(t)
 
 	t.Run("a generated id is echoed back", func(t *testing.T) {
-		resp, err := srv.Client().Get(srv.URL + "/healthz")
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/healthz", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := srv.Client().Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -274,7 +278,7 @@ func TestRequestIDPropagation(t *testing.T) {
 	})
 
 	t.Run("a caller-supplied id is preserved", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/healthz", nil)
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/healthz", nil)
 		req.Header.Set("X-Request-ID", "my-trace-42")
 		resp, err := srv.Client().Do(req)
 		if err != nil {
@@ -290,7 +294,7 @@ func TestRequestIDPropagation(t *testing.T) {
 	// so the injection case is covered by a unit test on sanitizeRequestID.
 	// This asserts on a hostile value the client will actually send.
 	t.Run("disallowed characters are stripped", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/healthz", nil)
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/healthz", nil)
 		req.Header.Set("X-Request-ID", `abc<script>alert(1)</script>`)
 		resp, err := srv.Client().Do(req)
 		if err != nil {

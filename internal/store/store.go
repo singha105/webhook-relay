@@ -13,10 +13,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// pgErrUniqueViolation is the SQLSTATE Postgres raises when a UNIQUE index
-// rejects a row. Ingest depends on catching exactly this code.
-const pgErrUniqueViolation = "23505"
-
 // pgErrForeignKeyViolation is raised when an event references an endpoint that
 // does not exist.
 const pgErrForeignKeyViolation = "23503"
@@ -78,16 +74,11 @@ func (s *Store) Ping(ctx context.Context) error {
 	return s.pool.Ping(ctx)
 }
 
-// isUniqueViolation reports whether err is a UNIQUE constraint violation, and
-// if so which constraint. Ingest uses this to turn a lost insert race into a
-// 200 rather than a 500.
-func isUniqueViolation(err error) (string, bool) {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgErrUniqueViolation {
-		return pgErr.ConstraintName, true
-	}
-	return "", false
-}
+// NOTE: there is deliberately no isUniqueViolation helper. An earlier draft
+// caught SQLSTATE 23505 in Go to detect a duplicate idempotency key. The
+// ON CONFLICT DO UPDATE in CreateEvent means a duplicate is never an error in
+// the first place, so that helper was dead code — and its existence would
+// imply a failure mode the design does not have.
 
 // isForeignKeyViolation reports whether err is an FK violation, which for our
 // schema always means "the referenced endpoint does not exist".

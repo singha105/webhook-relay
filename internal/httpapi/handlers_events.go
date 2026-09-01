@@ -36,8 +36,8 @@ func (s *Server) ingestEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	idempotencyKey := r.Header.Get(HeaderIdempotencyKey)
-	if err := models.ValidateIdempotencyKey(idempotencyKey); err != nil {
-		writeValidationError(w, r, err)
+	if keyErr := models.ValidateIdempotencyKey(idempotencyKey); keyErr != nil {
+		writeValidationError(w, r, keyErr)
 		return
 	}
 	// nil, not "", when the header is absent: the partial unique index only
@@ -90,7 +90,7 @@ func (s *Server) ingestEvent(w http.ResponseWriter, r *http.Request) {
 
 // getEvent handles GET /v1/events/{id}, returning status plus attempt history.
 func (s *Server) getEvent(w http.ResponseWriter, r *http.Request) {
-	id, ok := parseIDParam(w, r, "id")
+	id, ok := parseIDParam(w, r)
 	if !ok {
 		return
 	}

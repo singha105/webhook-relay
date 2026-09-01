@@ -2,6 +2,7 @@ package httpapi_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -188,6 +189,7 @@ func TestIngestIdempotencyRaceOverHTTP(t *testing.T) {
 	srv := newTestServer(t)
 	endpointID := createEndpoint(t, srv)
 
+	ctx := t.Context()
 	const concurrency = 10
 	payload, err := json.Marshal(map[string]any{
 		"endpoint_id": endpointID,
@@ -218,7 +220,7 @@ func TestIngestIdempotencyRaceOverHTTP(t *testing.T) {
 	for i := 0; i < concurrency; i++ {
 		go func(i int) {
 			defer done.Done()
-			req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/events", bytes.NewReader(payload))
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/v1/events", bytes.NewReader(payload))
 			if err != nil {
 				outcomes[i] = outcome{err: err}
 				ready.Done()
@@ -293,7 +295,11 @@ func warmHTTPClient(t *testing.T, srv *httptest.Server, n int) {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
-			resp, err := srv.Client().Get(srv.URL + "/healthz")
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/healthz", nil)
+			if err != nil {
+				return
+			}
+			resp, err := srv.Client().Do(req)
 			if err != nil {
 				return
 			}

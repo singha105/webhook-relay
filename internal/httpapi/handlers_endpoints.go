@@ -73,7 +73,7 @@ func (s *Server) listEndpoints(w http.ResponseWriter, r *http.Request) {
 
 // getEndpoint handles GET /v1/endpoints/{id}.
 func (s *Server) getEndpoint(w http.ResponseWriter, r *http.Request) {
-	id, ok := parseIDParam(w, r, "id")
+	id, ok := parseIDParam(w, r)
 	if !ok {
 		return
 	}
@@ -91,7 +91,7 @@ func (s *Server) getEndpoint(w http.ResponseWriter, r *http.Request) {
 
 // updateEndpoint handles PATCH /v1/endpoints/{id}.
 func (s *Server) updateEndpoint(w http.ResponseWriter, r *http.Request) {
-	id, ok := parseIDParam(w, r, "id")
+	id, ok := parseIDParam(w, r)
 	if !ok {
 		return
 	}
@@ -118,7 +118,7 @@ func (s *Server) updateEndpoint(w http.ResponseWriter, r *http.Request) {
 
 // deleteEndpoint handles DELETE /v1/endpoints/{id}.
 func (s *Server) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
-	id, ok := parseIDParam(w, r, "id")
+	id, ok := parseIDParam(w, r)
 	if !ok {
 		return
 	}
@@ -138,12 +138,15 @@ func (s *Server) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// parseIDParam reads a UUID URL parameter, answering 404 rather than 400 on a
-// malformed value: from the client's perspective "/v1/endpoints/garbage" is a
-// URL that addresses nothing, and returning 400 would leak that the segment is
-// parsed as a UUID.
-func parseIDParam(w http.ResponseWriter, r *http.Request, name string) (uuid.UUID, bool) {
-	raw := chi.URLParam(r, name)
+// parseIDParam reads the {id} URL parameter as a UUID, answering 404 rather
+// than 400 on a malformed value: from the client's perspective
+// "/v1/endpoints/garbage" is a URL that addresses nothing, and 400 would leak
+// that the segment is parsed as a UUID.
+//
+// Every route in this API names its identifier "id", so the parameter name is
+// fixed rather than passed in.
+func parseIDParam(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	raw := chi.URLParam(r, "id")
 	id, err := uuid.Parse(raw)
 	if err != nil {
 		writeError(w, r, http.StatusNotFound, CodeNotFound, "not found")

@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -136,11 +137,16 @@ func AccessLog(next http.Handler) http.Handler {
 // server error it can retry.
 func Recoverer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		//nolint:contextcheck // the recovery path intentionally uses the
+		// request's own context via writeError; there is no parent context to
+		// thread through a deferred panic handler.
 		defer func() {
 			if rec := recover(); rec != nil {
 				// http.ErrAbortHandler is the documented way to abort a
 				// response deliberately; re-panic so net/http handles it.
-				if rec == http.ErrAbortHandler {
+				// errors.Is rather than ==, so a wrapped sentinel still
+				// short-circuits here instead of being logged as a crash.
+				if err, ok := rec.(error); ok && errors.Is(err, http.ErrAbortHandler) {
 					panic(rec)
 				}
 				LoggerFrom(r.Context()).Error("panic recovered",

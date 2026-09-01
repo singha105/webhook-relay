@@ -142,8 +142,8 @@ func NewStore(t *testing.T) *store.Store {
 	}
 	defer adminPool.Close()
 
-	if _, err := adminPool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %q", schema)); err != nil {
-		t.Fatalf("create schema %s: %v", schema, err)
+	if _, createErr := adminPool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %q", schema)); createErr != nil {
+		t.Fatalf("create schema %s: %v", schema, createErr)
 	}
 
 	cfg, err := pgxpool.ParseConfig(dsn)
@@ -165,12 +165,16 @@ func NewStore(t *testing.T) *store.Store {
 		t.Fatalf("apply migrations: %v", err)
 	}
 
+	// context.Background inside, not the test's context: cleanup runs after the
+	// test finishes, when a test-scoped context is already cancelled and the
+	// DROP SCHEMA would never reach the server.
+	//nolint:contextcheck // a fresh context is required here, see above.
 	t.Cleanup(func() {
 		pool.Close()
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		dropPool, err := pgxpool.New(cleanupCtx, dsn)
-		if err != nil {
+		dropPool, dropErr := pgxpool.New(cleanupCtx, dsn)
+		if dropErr != nil {
 			return
 		}
 		defer dropPool.Close()

@@ -1,0 +1,92 @@
+# golangci-lint v2 configuration.
+#
+# The goal is a linter set that catches real defects without generating noise a
+# reviewer learns to ignore. Anything enabled here has to earn its place by
+# finding bugs, not style opinions — formatting is handled by the formatters
+# block, not by lint failures.
+version: "2"
+
+run:
+  timeout: 5m
+  # Lint test files too. Most of this project's interesting logic lives in
+  # integration tests, and an unchecked error there produces a test that
+  # silently passes.
+  tests: true
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose      # an unclosed HTTP response body leaks a connection —
+                     # directly relevant to a service that makes outbound calls
+    - contextcheck   # catches a dropped context, which breaks request timeouts
+    - errorlint      # enforces %w and errors.Is over == comparisons
+    - gosec          # security-focused checks
+    - misspell
+    - nilerr         # returning nil after checking err != nil
+    - noctx          # HTTP requests built without a context
+    - prealloc       # slice preallocation on the hot ingest path
+    - revive         # golint's successor, for exported-symbol documentation
+    - rowserrcheck   # a missed rows.Err() silently truncates a result set
+    - sqlclosecheck  # unclosed rows leak a pooled connection
+    - unconvert
+    - unparam
+    - wastedassign
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+    govet:
+      enable-all: true
+      disable:
+        # fieldalignment optimizes struct memory layout at the cost of grouping
+        # fields logically. Our structs are read by humans far more often than
+        # they are allocated in bulk.
+        - fieldalignment
+    revive:
+      rules:
+        - name: exported
+          disabled: false
+        - name: package-comments
+          disabled: false
+    gosec:
+      excludes:
+        # G404 (weak random) — we use crypto/rand everywhere it matters, and
+        # gosec cannot tell that a test fixture is not a security boundary.
+        - G404
+
+  exclusions:
+    rules:
+      # Test files get a lighter touch: unchecked errors in fixture setup are
+      # already fatal via t.Fatalf, and duplicated table-test scaffolding is
+      # the point of table tests.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - unparam
+          # Test cleanup deliberately uses context.Background(): it runs after
+          # the test finishes, when a test-scoped context is already cancelled
+          # and the teardown statement would never reach the server.
+          - contextcheck
+      # `if err := f(); err != nil` inside a function that already has an err
+      # is idiomatic Go, and table-driven tests use the pattern constantly.
+      # Shadowing stays enabled for non-test code, where it can hide a bug.
+      - path: _test\.go
+        text: "shadow: declaration of \"err\""
+        linters:
+          - govet
+      # The migration-file reader takes a path built from our own repo layout,
+      # not from user input.
+      - path: test/postgres\.go
+        linters:
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/singha105/webhook-relay

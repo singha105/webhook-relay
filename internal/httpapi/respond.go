@@ -13,6 +13,9 @@ import (
 // this; the human-readable message is free to change without breaking them.
 type ErrorCode string
 
+// The complete set of error codes this API emits. Clients may switch on these
+// exhaustively; a new code is a breaking change for a strict client, so they
+// are added deliberately rather than inlined at a call site.
 const (
 	CodeValidationFailed ErrorCode = "validation_failed"
 	CodeMalformedJSON    ErrorCode = "malformed_json"

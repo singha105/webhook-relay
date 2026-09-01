@@ -45,7 +45,11 @@ type Config struct {
 // Defaults. Chosen to make `make up` work with no environment at all, which is
 // what keeps a fresh clone to one command.
 const (
-	defaultHTTPAddr         = ":8080"
+	defaultHTTPAddr = ":8080"
+	// Matches the credentials the local compose stack creates. This is a
+	// development default, not a secret: the real value arrives from a
+	// Kubernetes Secret via DATABASE_URL.
+	//nolint:gosec // G101: not a credential, a local-only default.
 	defaultDatabaseURL      = "postgres://webhook_relay:webhook_relay@localhost:5432/webhook_relay?sslmode=disable"
 	defaultValkeyURL        = "redis://localhost:6379"
 	defaultLogLevel         = "info"
@@ -53,6 +57,11 @@ const (
 	defaultDBConnectTimeout = 10 * time.Second
 	defaultShutdownTimeout  = 15 * time.Second
 	defaultRequestTimeout   = 15 * time.Second
+
+	// maxDBConns caps the pool. Postgres allocates memory per backend, so an
+	// unbounded pool exhausts the server rather than queueing at the client.
+	// It also keeps the value inside int32, which is what pgxpool takes.
+	maxDBConns = 10000
 )
 
 // Load reads configuration from the environment, applying defaults. It returns
@@ -73,13 +82,20 @@ func Load() (*Config, error) {
 	}
 	cfg.LogLevel = level
 
+	// Bounded on both sides before the int32 conversion. pgxpool takes an
+	// int32, so an unchecked cast of a large value would silently wrap to a
+	// negative pool size.
 	maxConns, err := envInt("DB_MAX_CONNS", defaultDBMaxConns)
-	if err != nil {
+	switch {
+	case err != nil:
 		problems = append(problems, err.Error())
-	} else if maxConns < 1 {
+	case maxConns < 1:
 		problems = append(problems, "DB_MAX_CONNS: must be at least 1")
+	case maxConns > maxDBConns:
+		problems = append(problems, fmt.Sprintf("DB_MAX_CONNS: must be at most %d", maxDBConns))
+	default:
+		cfg.DBMaxConns = int32(maxConns)
 	}
-	cfg.DBMaxConns = int32(maxConns)
 
 	for _, d := range []struct {
 		name string
