@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to a PR makes the previous run's answer irrelevant, so cancel it
+# rather than paying for both.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: gofmt
+        # golangci-lint's formatters report but do not fail the build on their
+        # own, so unformatted code is caught explicitly here.
+        run: |
+          unformatted=$(gofmt -s -l . | grep -v '^vendor/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt -s clean:"
+            echo "$unformatted"
+            gofmt -s -d $unformatted
+            exit 1
+          fi
+
+      - name: no source file is gitignored
+        # A bare pattern in .gitignore matches that name at any depth, so an
+        # entry meant for a root-level build artifact can silently exclude a
+        # whole source directory. That happened: "api" and "worker" excluded
+        # cmd/api and cmd/worker, which built locally and were absent from the
+        # repository. This is the cheap guard against the entire class.
+        run: |
+          hidden=$(git ls-files --others --ignored --exclude-standard -- '*.go' '*.sql')
+          if [ -n "$hidden" ]; then
+            echo "these source files are excluded by .gitignore and are not in the repo:"
+            echo "$hidden"
+            exit 1
+          fi
+          echo "no source files are gitignored"
+
+      - name: go vet
+        run: go vet ./...
+
+      # v7 of the action is required for golangci-lint v2 — v6 rejects a v2
+      # version string outright.
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.13.2
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go mod tidy is clean
+        # A drifting go.mod is a merge conflict waiting to happen, and it means
+        # CI is not building what a fresh clone would build.
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: build
+        run: go build ./...
+
+      # No service containers: the integration tests start their own Postgres
+      # through testcontainers-go, using the Docker daemon the runner already
+      # provides. That keeps the CI environment identical to a laptop, so a
+      # green run here means the same command works locally.
+      - name: test
+        run: go test ./... -race -count=1 -coverprofile=coverage.out -covermode=atomic
+        env:
+          # Ryuk is testcontainers' cleanup sidecar. The runner is destroyed
+          # after the job, so it has nothing to clean up and only adds startup
+          # time and one more thing to fail.
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+
+      - name: coverage summary
+        run: |
+          go tool cover -func=coverage.out | tail -1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks scans history, which needs the full clone rather than the
+          # default depth-1 checkout.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  stack:
+    name: compose stack comes up clean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The claim in the README is that a fresh clone plus one command produces
+      # a working system. This job is what keeps that claim true: it builds the
+      # image, starts the stack, migrates, and exercises the ingest path
+      # exactly as the day-1 verification steps do.
+      - name: make up
+        run: make up
+
+      - name: make migrate-up
+        run: make migrate-up
+
+      - name: register an endpoint and post an event
+        run: |
+          set -euo pipefail
+          endpoint_id=$(curl -fsS -X POST http://localhost:8080/v1/endpoints \
+            -H 'Content-Type: application/json' \
+            -d '{"url":"https://example.com/hook","description":"ci"}' \
+            | jq -r '.id')
+          echo "endpoint: $endpoint_id"
+
+          code=$(curl -fsS -o /tmp/ev.json -w '%{http_code}' -X POST http://localhost:8080/v1/events \
+            -H 'Content-Type: application/json' \
+            -H 'Idempotency-Key: ci-key' \
+            -d "{\"endpoint_id\":\"$endpoint_id\",\"event_type\":\"ci.test\",\"payload\":{\"n\":1}}")
+          [ "$code" = "202" ] || { echo "first POST returned $code, want 202"; exit 1; }
+          first=$(jq -r '.id' /tmp/ev.json)
+
+          code=$(curl -fsS -o /tmp/ev2.json -w '%{http_code}' -X POST http://localhost:8080/v1/events \
+            -H 'Content-Type: application/json' \
+            -H 'Idempotency-Key: ci-key' \
+            -d "{\"endpoint_id\":\"$endpoint_id\",\"event_type\":\"ci.test\",\"payload\":{\"n\":1}}")
+          [ "$code" = "200" ] || { echo "replay returned $code, want 200"; exit 1; }
+          second=$(jq -r '.id' /tmp/ev2.json)
+
+          [ "$first" = "$second" ] || { echo "idempotency produced two events"; exit 1; }
+          echo "idempotent ingest verified: $first"
+
+      - name: dump logs on failure
+        if: failure()
+        run: docker compose -f deploy/compose/docker-compose.yml logs
+
+      - name: make down
+        if: always()
+        run: make down

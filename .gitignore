@@ -1,9 +1,13 @@
-# Binaries
+# Binaries.
+# These MUST stay anchored with a leading slash. An unanchored "api" matches
+# any path segment at any depth, which silently excluded cmd/api and
+# cmd/worker from the repository — the code built locally and the image failed
+# to build in CI.
 /bin/
 /dist/
-webhook-relay
-api
-worker
+/webhook-relay
+/api
+/worker
 *.exe
 
 # Test & coverage

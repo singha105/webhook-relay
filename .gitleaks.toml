@@ -1,0 +1,14 @@
+# gitleaks configuration for webhook-relay.
+# Extends the upstream default ruleset and allowlists the deterministic
+# fixtures our tests rely on.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Test fixtures and documented example values are not real secrets."
+paths = [
+  '''\.env\.example$''',
+  '''^deploy/compose/docker-compose\.yml$''',
+  '''_test\.go$''',
+  '''^README\.md$''',
+]
