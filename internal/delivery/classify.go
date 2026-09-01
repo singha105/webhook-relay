@@ -44,8 +44,13 @@ type Result struct {
 	StatusCode *int
 	// ResponseBody is truncated by the caller before storage.
 	ResponseBody string
-	// Err is the transport error, if any.
+	// Err is the underlying error, kept for logging.
 	Err error
+	// ErrorMessage is the normalized, storable description of the failure.
+	// Empty on success. This is what lands in delivery_attempts.error_message,
+	// so it must be stable enough to group on — "request timed out" rather
+	// than a message containing an ephemeral port number.
+	ErrorMessage string
 	// RetryAfter is a server-requested delay parsed from the Retry-After
 	// header. Zero means the header was absent or unusable.
 	RetryAfter time.Duration
