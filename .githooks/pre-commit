@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Blocks commits containing secrets. Installed by `make hooks` (run automatically
+# by `make up`). Bypass in an emergency with `git commit --no-verify`.
+set -euo pipefail
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks not installed — install it with 'brew install gitleaks'." >&2
+  echo "pre-commit: refusing to commit without secret scanning." >&2
+  exit 1
+fi
+
+echo "pre-commit: scanning staged changes for secrets..."
+if ! gitleaks git --staged --redact --no-banner --verbose; then
+  echo "" >&2
+  echo "pre-commit: BLOCKED — a secret was detected in your staged changes." >&2
+  echo "pre-commit: remove it, or add a false positive to .gitleaks.toml allowlist." >&2
+  exit 1
+fi
+echo "pre-commit: clean."
