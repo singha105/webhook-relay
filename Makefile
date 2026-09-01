@@ -39,9 +39,11 @@ preflight: ## Fail early and clearly if a required host port is taken
 	@fail=0; \
 	for spec in "API_PORT:$(API_PORT)" "POSTGRES_PORT:$(POSTGRES_PORT)" "VALKEY_PORT:$(VALKEY_PORT)"; do \
 		var=$${spec%%:*}; port=$${spec##*:}; \
-		if lsof -nP -iTCP:$$port -sTCP:LISTEN >/dev/null 2>&1; then \
-			if docker ps --format '{{.Ports}}' 2>/dev/null | grep -q ":$$port->"; then continue; fi; \
+		if docker ps --format '{{.Ports}}' 2>/dev/null | grep -q ":$$port->"; then continue; fi; \
+		: ; \
+		if netstat -an 2>/dev/null | grep -qE "[.:]$$port[ \t]+.*LISTEN"; then \
 			owner=$$(lsof -nP -iTCP:$$port -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print $$1}'); \
+			[ -n "$$owner" ] || owner="another process"; \
 			echo "  port $$port is already in use by '$$owner'"; \
 			echo "     override it:  echo '$$var=<free-port>' >> .env  &&  make up"; \
 			fail=1; \
@@ -50,8 +52,16 @@ preflight: ## Fail early and clearly if a required host port is taken
 	if [ $$fail -ne 0 ]; then \
 		echo ""; \
 		echo "  refusing to start — see .env.example for every overridable port."; \
+		echo "  find a free port:  make free-port"; \
 		exit 1; \
 	fi
+
+.PHONY: free-port
+free-port: ## Print the first free host port at or above 8100
+	@for p in $$(seq 8100 8200); do \
+		if ! netstat -an 2>/dev/null | grep -qE "[.:]$$p[ \t]+.*LISTEN"; then echo "$$p"; exit 0; fi; \
+	done; \
+	echo "no free port found in 8100-8200" >&2; exit 1
 
 .PHONY: up
 up: hooks preflight ## Build and start the full stack, then wait until it is serving
