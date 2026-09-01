@@ -1,0 +1,53 @@
+# Binaries
+/bin/
+/dist/
+webhook-relay
+api
+worker
+*.exe
+
+# Test & coverage
+*.out
+coverage.html
+/testdata/tmp/
+
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!**/testdata/*.key
+id_rsa*
+*_rsa
+credentials.json
+secrets.yaml
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# Kubernetes / Helm
+kubeconfig
+*.kubeconfig
+charts/**/charts/
+charts/**/Chart.lock
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Go workspace
+go.work
+go.work.sum
+
+# Local data volumes
+/deploy/compose/data/
