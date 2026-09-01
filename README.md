@@ -9,15 +9,15 @@ failure modes — the kind of service Stripe or Svix runs internally.
 
 ---
 
-## Status: Day 1 of 6
+## Status: Day 2 of 6
 
 This repository is being built in public, one day at a time. **Only what is
 described below actually works.** Nothing here is a stub presented as finished.
 
 | | |
 |---|---|
-| ✅ **Working today** | Ingest API, endpoint management, Postgres persistence, idempotent ingest, migrations, local stack, CI |
-| ⬜ **Not built yet** | Delivery. Events are persisted with status `pending` and **nothing sends them**. The worker binary starts, logs a warning that it has no delivery loop, and idles. |
+| ✅ **Working today** | Ingest API, idempotent ingest, transactional outbox, Valkey Streams queue, delivery worker pool, HMAC-SHA256 signing, full-jitter retries, dead letter queue, replay, stale-claim recovery |
+| ⬜ **Not built yet** | Circuit breaker (Day 3), observability (Day 4), Kubernetes and chaos testing (Day 5), load test and postmortem (Day 6). `rate_limit_per_sec` is stored and validated but **not enforced**. |
 
 The roadmap is at the [bottom of this file](#roadmap).
 
@@ -45,6 +45,14 @@ Then seed some data:
 
 ```bash
 make seed
+```
+
+To watch delivery actually happen — retries, dead-lettering, replay, and a
+signature verified against `openssl` — start the stack with a controllable
+receiver and run the demonstration:
+
+```bash
+make demo-up && make demo
 ```
 
 <details>
@@ -99,6 +107,43 @@ row.
 This is resolved by the database, not the application. See
 [the idempotency race](#the-idempotency-race) below.
 
+### Deliver it, retry it, dead-letter it
+
+A worker signs the payload, POSTs it, and records every attempt. When the
+endpoint keeps failing, retries back off with full jitter until the attempt
+budget is spent and the event is dead-lettered.
+
+![retry with full jitter, then dead letter](docs/images/retry.png)
+
+Look at the gaps rather than the timestamps. The **ceiling** doubles — 2s, 4s,
+8s, 16s, 32s — but each actual delay is a uniform draw from `[0, ceiling)`, so
+the sequence trends upward without being monotonic. The 5→6 gap of 10s under a
+32s ceiling is the jitter working, not a bug. A perfectly doubling sequence
+would mean it was not.
+
+Note also `duplicate dispatches: {}` — six attempts, six deliveries, no
+attempt sent twice.
+
+### Replay it, and verify the signature
+
+Point the endpoint at something healthy and replay from the DLQ. The attempt
+budget resets; the failure history does not disappear.
+
+![replay from the DLQ and verify the signature](docs/images/replay.png)
+
+The last step recomputes the HMAC with `openssl` and compares it to the `v1=`
+digest we sent. It matches, which means the signature scheme is verifiable by
+anything that can compute an HMAC — not just by our own Go code.
+
+### Everything self-probes
+
+![container health](docs/images/health.png)
+
+The runtime image is distroless — no shell, no curl — so each binary probes
+itself via `-healthcheck`. The API GETs its own `/readyz`; the worker, which
+serves no HTTP, checks that Postgres and Valkey are both reachable using its
+real configuration.
+
 ---
 
 ## API
@@ -112,6 +157,7 @@ This is resolved by the database, not the application. See
 | `DELETE` | `/v1/endpoints/{id}` | `204`, cascades to events and attempts |
 | `POST` | `/v1/events` | `202` accepted, or `200` on an idempotent replay |
 | `GET` | `/v1/events/{id}` | `200` status + full attempt history |
+| `POST` | `/v1/events/{id}/replay` | `202` requeued with a fresh budget, or `409` if not terminal |
 | `GET` | `/healthz` | liveness — touches no dependency |
 | `GET` | `/readyz` | readiness — pings Postgres |
 
@@ -169,6 +215,154 @@ winner, and hands back the surviving row.
 "Was it created?" is answered by comparing the returned ID to the UUIDv7 we
 generated — the database can only return our ID if our insert was the one that
 landed. That avoids the `xmax = 0` trick and its dependence on a system column.
+
+### The transactional outbox
+
+Ingest has to do two things — persist the event, and make it deliverable — and
+they live in two systems with no transaction spanning them. Whichever order you
+pick, a crash between them breaks something:
+
+| Order | Crash in between |
+|---|---|
+| Enqueue, then insert | A message pointing at an event that does not exist. |
+| Insert, then enqueue | An event nothing will ever deliver. **Silent loss** — nothing reports an error. |
+
+The outbox removes the choice. **Ingest writes only to Postgres**, in one
+transaction, and returns `202`. A separate relay is the queue's only producer,
+and it derives what to enqueue from the durable rows. A crash can then only
+cause a *duplicate* enqueue, never a lost event — and duplicates are already
+inside the at-least-once contract.
+
+**What it costs:** an event waits up to one relay poll (250ms by default)
+before it is enqueued. That is the price of not lying about atomicity.
+
+The relay claims with a **lease** rather than holding a transaction open across
+the enqueue. The textbook version — `BEGIN`, `SELECT … FOR UPDATE SKIP LOCKED`,
+`XADD`, `UPDATE`, `COMMIT` — holds Postgres row locks across a network round
+trip to a different system. Under load that turns every Valkey hiccup into lock
+contention and a Valkey timeout into a long transaction blocking vacuum.
+Instead the claim and the lease happen in one statement; what happens if the
+relay dies mid-batch is enumerated case by case in
+[`ClaimDueEvents`](internal/store/delivery.go).
+
+### Valkey Streams, not a LIST and not SKIP LOCKED
+
+A stream with a consumer group is the only one of the three that can express
+*"this worker is holding this job right now, and if it dies somebody else must
+get it."*
+
+- **Not a LIST.** `LPOP` hands the job over and forgets it. Kill that worker
+  between the pop and the HTTP call — which is exactly what Day 5 does — and the
+  job is gone with no record it existed. `BRPOPLPUSH` into per-worker processing
+  lists gets partway, but recovery then means enumerating every worker's list
+  and deciding which owners are still alive: a consumer group rebuilt by hand.
+- **Not Postgres `SKIP LOCKED`**, though the relay itself uses it. Every polling
+  worker would hold a connection for its whole transaction, bounding worker
+  count by `max_connections`, and queue churn would land on the same disk as the
+  durable event log.
+- **Streams** keep a per-group pending-entries list. `XREADGROUP` moves an entry
+  there under a named consumer until `XACK`; `XAUTOCLAIM` reassigns entries idle
+  too long. That is the recovery primitive, not something we build.
+
+**What we give up:** the pending list is memory-resident; there is no delayed
+redelivery, so backoff lives in Postgres; and it is at-least-once, never
+exactly-once.
+
+### Two independent recovery paths
+
+A worker can die holding a job. So can Valkey.
+
+| Failure | Recovered by |
+|---|---|
+| Worker dies holding a claim | `XAUTOCLAIM` after `STALE_CLAIM_TIMEOUT` (60s) |
+| Worker dies **and** Valkey loses the pending list | The Postgres lease expiring after `DELIVERY_LEASE` (5m) |
+
+The second is the one people forget. `XAUTOCLAIM` cannot recover an entry from a
+pending list that no longer exists — a restarted pod, a flushed database, a
+recreated consumer group. Only a durable lease covers both together, which is
+why `next_retry_at` doubles as a lease expiry while an event is `delivering`.
+
+These timeouts have an ordering that must hold:
+
+```
+DELIVERY_TIMEOUT  <  STALE_CLAIM_TIMEOUT  <  DELIVERY_LEASE
+```
+
+Violate the first and a slow-but-healthy delivery gets reclaimed and duplicated
+while still in flight. Violate the second and the relay requeues events the
+workers still hold. **Both are validated at boot**, with an error naming the
+consequence — this is not the kind of thing you want to diagnose from duplicate
+deliveries under load.
+
+### Full jitter, and why it beats fixed backoff
+
+An endpoint goes down. Every in-flight event fails at the same instant. With a
+fixed delay — or with plain exponential backoff — every one of them retries at
+the same instant too. The herd stays synchronized: the endpoint recovers, takes
+the entire backlog as one spike, falls over, and the next round is just as
+synchronized as the last.
+
+**Backoff without jitter does not spread load. It postpones a stampede and then
+reproduces it**, with a longer gap between identical spikes.
+
+Drawing uniformly from `[0, ceiling)` breaks the correlation on the first retry
+round and keeps it broken, because every subsequent draw is independent.
+
+**What it costs:** the mean delay is halved (`E[U(0,c)] = c/2`), so clients
+retry sooner on average than the ceiling implies, and any individual sequence is
+not monotonically increasing. "Equal jitter" (`c/2 + U(0, c/2)`) trades some
+decorrelation for a tighter lower bound; full jitter wins here because the
+synchronized-herd case is exactly what Day 5 will create on purpose.
+
+The property is [tested directly](internal/delivery/backoff_test.go), not
+asserted in a comment: a thousand delays are bucketed across the window, every
+bucket must be occupied, and no bucket may hold an outsized share. Without
+jitter, one bucket would hold all thousand.
+
+### Delivery-side deduplication, and its honest limits
+
+Before dispatching, a worker claims `delivery:{event_id}:{attempt}` with
+`SETNX` and a TTL. If the key exists, another worker already sent this exact
+attempt.
+
+Keyed on the **pair**, not the event: retries are supposed to happen, and only a
+redelivery of the *same attempt* is a duplicate.
+
+**This narrows the window. It cannot close it.** The gap between claiming the
+key and the request reaching the receiver is still unprotected, and reversing
+the order just trades one failure for the other. There is no exactly-once across
+a network boundary — which is why every delivery carries a stable
+`X-Webhook-Id` and [`pkg/webhook`](pkg/webhook) tells receivers to deduplicate
+on it.
+
+It also **fails open**: if Valkey is unreachable, the delivery proceeds.
+Refusing to deliver because the cache is down would convert a duplicate-delivery
+risk into a no-delivery outage.
+
+`DELIVERY_DEDUP_ENABLED=false` turns it off on purpose, so Day 5 can demonstrate
+the duplicates it prevents. A safety control that is never observed failing is
+indistinguishable from one that does nothing.
+
+### Retry classification
+
+| Response | Outcome | Why |
+|---|---|---|
+| `2xx` | Success | — |
+| `408`, `429` | Retry | Both explicitly describe a condition that will pass. |
+| Other `4xx` | **Permanent — straight to DLQ** | A 404 or a rejected signature will never succeed. Burning six attempts is wasted work for us, unwanted traffic for them, and it delays an operator noticing. |
+| `5xx` | Retry | The server is saying it failed, not that we did. |
+| `3xx` | Retry | We do not follow redirects, so this is a misconfigured receiver — one more chance beats dead-lettering on the first surprise. |
+| Transport error | Retry | A refused connection is indistinguishable from a restarting endpoint. |
+
+`Retry-After` is honoured on 429 and 503 in both RFC 9110 forms, clamped, and
+combined with our own backoff by taking the **maximum** — so a receiver cannot
+shorten our backoff by sending `Retry-After: 0`.
+
+### Redirects are not followed
+
+Beyond a `3xx` meaning a misconfigured receiver, following one would deliver a
+signed payload to a host the customer never registered — an SSRF primitive
+handed to whoever controls the original URL.
 
 ### UUIDv7 for event IDs
 
@@ -243,6 +437,20 @@ would only assert that our fake behaves like our fake.
 One container is shared per test binary; each test gets its own schema, so tests
 run in parallel without seeing each other's rows.
 
+### The pipeline is tested as a pipeline
+
+Twelve integration tests in [`internal/worker`](internal/worker) run a complete
+system — real Postgres, real Valkey, a real HTTP receiver, the relay, and the
+worker pool, wired exactly as `cmd/worker` wires them. They cover success, retry
+then success, permanent `4xx`, exhaustion into the DLQ, replay from the DLQ,
+signature verification, header correctness, inactive endpoints, and the
+consecutive-failure counter.
+
+They earned their keep immediately by catching a real bug: `ReplayEvent` checked
+for the pgx no-rows sentinel, but `scanEvent` had already normalized it to
+`models.ErrNotFound` — so the check never matched, `ErrNotReplayable` was
+unreachable, and the API would have answered `500` where it should answer `409`.
+
 ### The race test was verified by mutation
 
 A concurrency test that passes proves nothing unless it can fail. Swapping the
@@ -267,16 +475,21 @@ their connection pools before the starting gate opens.
 ## Layout
 
 ```
-cmd/api/          HTTP ingest + management API
-cmd/worker/       delivery worker — no delivery loop yet (day 2)
-internal/models/  domain types and validation; no I/O
-internal/store/   Postgres access; owns every SQL statement
-internal/queue/   queue interface; no implementation yet
-internal/httpapi/ routing, middleware, handlers
-internal/config/  environment-only configuration
-migrations/       golang-migrate SQL, indexes justified inline
-deploy/compose/   local stack: postgres 16, valkey 8, api
-test/             testcontainers helpers
+cmd/api/            HTTP ingest + management API
+cmd/worker/         outbox relay + delivery worker pool
+internal/models/    domain types and validation; no I/O
+internal/store/     Postgres access; owns every SQL statement
+internal/queue/     Valkey Streams work queue
+internal/relay/     transactional outbox: Postgres -> queue
+internal/worker/    delivery pool, retry and DLQ decisions
+internal/delivery/  HTTP client, backoff, classification, dedup
+internal/httpapi/   routing, middleware, handlers
+internal/config/    environment-only configuration
+pkg/webhook/        PUBLIC: signature verification for receivers
+migrations/         golang-migrate SQL, indexes justified inline
+deploy/compose/     local stack: postgres 16, valkey 8, api, worker
+test/               testcontainers helpers and the full-pipeline harness
+test/sink/          controllable webhook receiver for tests and the demo
 ```
 
 ---
@@ -286,14 +499,15 @@ test/             testcontainers helpers
 | Day | Deliverable |
 |---|---|
 | **1** ✅ | Ingest API, schema, idempotency, local stack, CI |
-| **2** | Delivery worker, Valkey Streams, HMAC-SHA256 signatures |
-| **3** | Exponential backoff with jitter, per-endpoint circuit breaker, DLQ |
+| **2** ✅ | Outbox relay, Valkey Streams, delivery worker, HMAC signing, full-jitter retries, DLQ, replay |
+| **3** | Per-endpoint circuit breaker and rate limiting |
 | **4** | OpenTelemetry → Prometheus, Tempo, Loki, Grafana |
 | **5** | k3d + Helm + Terraform + ArgoCD; Chaos Mesh fault injection |
 | **6** | k6 load test, benchmark numbers, and the postmortem |
 
-`endpoints.consecutive_failures` already exists in the schema so Day 3's circuit
-breaker is a code change rather than a migration against a populated table.
+`endpoints.consecutive_failures` is already maintained by the worker — reset on
+success, incremented on failure — so Day 3's circuit breaker reads a counter
+that is already correct rather than starting from zero against live data.
 
 ---
 
@@ -306,8 +520,15 @@ Stated plainly rather than discovered by a reviewer:
 - **No SSRF protection.** Endpoint URLs may point at loopback and private
   ranges, which is required for local testing but would need an egress allowlist
   in a hosted deployment.
-- **No rate limiting yet.** `rate_limit_per_sec` is stored and validated but not
-  enforced; it governs delivery, which does not exist until Day 2.
+- **No rate limiting yet.** `rate_limit_per_sec` is stored, validated, and read
+  by the worker, but nothing throttles on it. A busy endpoint can be hit as fast
+  as the pool can dispatch. Day 3.
+- **No circuit breaker yet.** `consecutive_failures` is maintained correctly but
+  nothing reads it to stop delivering. An endpoint that has been down for an
+  hour still gets the full retry schedule for every event. Day 3.
+- **Delivery is at-least-once, deliberately.** The dedup guard narrows the
+  duplicate window; it does not eliminate it. Receivers must deduplicate on
+  `X-Webhook-Id`.
 - **Offset pagination** on `GET /v1/endpoints` drifts under concurrent inserts.
   Acceptable because endpoints are registered by humans, not by traffic. The
   events table would need keyset pagination.
