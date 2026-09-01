@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/singha105/webhook-relay/internal/models"
 )
@@ -24,13 +26,30 @@ const attemptColumns = `id, event_id, attempt_number, status_code, response_body
 // — the caller does not need the surviving row back, only the guarantee that
 // exactly one exists.
 func (s *Store) RecordAttempt(ctx context.Context, a models.DeliveryAttempt) error {
+	return recordAttemptOn(ctx, s.pool, a)
+}
+
+// recordAttemptTx inserts an attempt inside a caller's transaction, so the
+// attempt row and the resulting event-status change commit together.
+func recordAttemptTx(ctx context.Context, tx pgx.Tx, a models.DeliveryAttempt) error {
+	return recordAttemptOn(ctx, tx, a)
+}
+
+// execer is the subset of pgxpool.Pool and pgx.Tx that recordAttemptOn needs,
+// so one statement serves both the standalone and the transactional path and
+// they cannot drift.
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func recordAttemptOn(ctx context.Context, db execer, a models.DeliveryAttempt) error {
 	const q = `
 		INSERT INTO delivery_attempts
 			(event_id, attempt_number, status_code, response_body, error_message, duration_ms)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (event_id, attempt_number) DO NOTHING`
 
-	_, err := s.pool.Exec(ctx, q,
+	_, err := db.Exec(ctx, q,
 		a.EventID, a.AttemptNumber, a.StatusCode,
 		models.TruncateResponseBody(a.ResponseBody), a.ErrorMessage, a.DurationMS,
 	)

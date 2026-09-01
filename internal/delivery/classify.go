@@ -13,12 +13,12 @@ import (
 type Outcome int
 
 const (
-	// OutcomeSuccess: the endpoint accepted the event. Terminal.
+	// OutcomeSuccess means the endpoint accepted the event. Terminal.
 	OutcomeSuccess Outcome = iota
-	// OutcomeRetryable: try again later, subject to the attempt budget.
+	// OutcomeRetryable means try again later, subject to the attempt budget.
 	OutcomeRetryable
-	// OutcomePermanent: retrying cannot help. Straight to the DLQ without
-	// burning the remaining attempts.
+	// OutcomePermanent means retrying cannot help. Straight to the DLQ,
+	// without burning the remaining attempts.
 	OutcomePermanent
 )
 

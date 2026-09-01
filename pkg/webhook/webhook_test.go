@@ -259,8 +259,14 @@ func TestSignIsDeterministic(t *testing.T) {
 	// receiver deduplicating on signature would see every retry as new.
 	body := []byte(`{"a":1}`)
 	ts := time.Unix(1700000000, 0)
-	if webhook.Sign(testSecret, ts, body) != webhook.Sign(testSecret, ts, body) {
-		t.Error("Sign() is not deterministic")
+
+	// Assigned rather than compared inline: staticcheck reads two identical
+	// call expressions as a tautology (SA4000), which is exactly the point
+	// here — the claim is that the function is pure, not that the syntax is.
+	first := webhook.Sign(testSecret, ts, body)
+	second := webhook.Sign(testSecret, ts, body)
+	if first != second {
+		t.Errorf("Sign() is not deterministic: %q then %q", first, second)
 	}
 }
 

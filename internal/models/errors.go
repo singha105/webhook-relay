@@ -9,6 +9,11 @@ import (
 // ErrNotFound is returned by the store when a requested row does not exist.
 var ErrNotFound = errors.New("not found")
 
+// ErrNotReplayable is returned when a replay is requested for an event that is
+// not in a terminal state. Replaying an in-flight event would race the worker
+// holding it and could produce two live delivery chains for one event.
+var ErrNotReplayable = errors.New("event is not in a replayable state")
+
 // FieldError describes a single failed validation rule.
 type FieldError struct {
 	Field   string `json:"field"`

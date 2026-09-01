@@ -40,6 +40,38 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	// RequestTimeout bounds any single HTTP request.
 	RequestTimeout time.Duration
+
+	// --- delivery (day 2) ---
+
+	// WorkerConcurrency is the number of delivery goroutines per process.
+	WorkerConcurrency int
+	// DeliveryTimeout bounds one outbound webhook call.
+	DeliveryTimeout time.Duration
+	// MaxAttempts is the total delivery attempts before the dead letter queue.
+	MaxAttempts int
+	// RetryBaseDelay and RetryMaxDelay bound the full-jitter backoff window.
+	RetryBaseDelay time.Duration
+	RetryMaxDelay  time.Duration
+	// StaleClaimTimeout is how long a queue entry may be held unacknowledged
+	// before another worker may reclaim it.
+	StaleClaimTimeout time.Duration
+	// RelayPollInterval is how often the outbox relay looks for due events.
+	RelayPollInterval time.Duration
+	// RelayBatchSize bounds one relay claim.
+	RelayBatchSize int
+	// DeliveryLease is how long a claimed event may sit in 'delivering' before
+	// it is presumed abandoned.
+	DeliveryLease time.Duration
+
+	// DeliveryDedupEnabled guards against dispatching the same (event,
+	// attempt) twice after a message is reclaimed.
+	//
+	// Switchable OFF on purpose. Day 5 turns it off to demonstrate the
+	// duplicate deliveries it prevents — a safety control that is never
+	// observed failing is indistinguishable from one that does nothing.
+	DeliveryDedupEnabled bool
+	// DeliveryDedupTTL is how long a dispatch marker lives.
+	DeliveryDedupTTL time.Duration
 }
 
 // Defaults. Chosen to make `make up` work with no environment at all, which is
@@ -57,6 +89,17 @@ const (
 	defaultDBConnectTimeout = 10 * time.Second
 	defaultShutdownTimeout  = 15 * time.Second
 	defaultRequestTimeout   = 15 * time.Second
+
+	defaultWorkerConcurrency = 10
+	defaultDeliveryTimeout   = 10 * time.Second
+	defaultMaxAttempts       = 6
+	defaultRetryBaseDelay    = time.Second
+	defaultRetryMaxDelay     = time.Hour
+	defaultStaleClaimTimeout = 60 * time.Second
+	defaultRelayPollInterval = 250 * time.Millisecond
+	defaultRelayBatchSize    = 100
+	defaultDeliveryLease     = 5 * time.Minute
+	defaultDedupTTL          = 15 * time.Minute
 
 	// maxDBConns caps the pool. Postgres allocates memory per backend, so an
 	// unbounded pool exhausts the server rather than queueing at the client.
@@ -97,6 +140,35 @@ func Load() (*Config, error) {
 		cfg.DBMaxConns = int32(maxConns)
 	}
 
+	for _, n := range []struct {
+		name string
+		def  int
+		dst  *int
+		min  int
+		max  int
+	}{
+		{"WORKER_CONCURRENCY", defaultWorkerConcurrency, &cfg.WorkerConcurrency, 1, 1000},
+		{"MAX_ATTEMPTS", defaultMaxAttempts, &cfg.MaxAttempts, 1, 100},
+		{"RELAY_BATCH_SIZE", defaultRelayBatchSize, &cfg.RelayBatchSize, 1, 10000},
+	} {
+		v, err := envInt(n.name, n.def)
+		if err != nil {
+			problems = append(problems, err.Error())
+			continue
+		}
+		if v < n.min || v > n.max {
+			problems = append(problems, fmt.Sprintf("%s: must be between %d and %d", n.name, n.min, n.max))
+			continue
+		}
+		*n.dst = v
+	}
+
+	dedup, dedupErr := envBool("DELIVERY_DEDUP_ENABLED", true)
+	if dedupErr != nil {
+		problems = append(problems, dedupErr.Error())
+	}
+	cfg.DeliveryDedupEnabled = dedup
+
 	for _, d := range []struct {
 		name string
 		def  time.Duration
@@ -105,6 +177,13 @@ func Load() (*Config, error) {
 		{"DB_CONNECT_TIMEOUT", defaultDBConnectTimeout, &cfg.DBConnectTimeout},
 		{"SHUTDOWN_TIMEOUT", defaultShutdownTimeout, &cfg.ShutdownTimeout},
 		{"REQUEST_TIMEOUT", defaultRequestTimeout, &cfg.RequestTimeout},
+		{"DELIVERY_TIMEOUT", defaultDeliveryTimeout, &cfg.DeliveryTimeout},
+		{"RETRY_BASE_DELAY", defaultRetryBaseDelay, &cfg.RetryBaseDelay},
+		{"RETRY_MAX_DELAY", defaultRetryMaxDelay, &cfg.RetryMaxDelay},
+		{"STALE_CLAIM_TIMEOUT", defaultStaleClaimTimeout, &cfg.StaleClaimTimeout},
+		{"RELAY_POLL_INTERVAL", defaultRelayPollInterval, &cfg.RelayPollInterval},
+		{"DELIVERY_LEASE", defaultDeliveryLease, &cfg.DeliveryLease},
+		{"DELIVERY_DEDUP_TTL", defaultDedupTTL, &cfg.DeliveryDedupTTL},
 	} {
 		v, err := envDuration(d.name, d.def)
 		if err != nil {
@@ -120,6 +199,26 @@ func Load() (*Config, error) {
 
 	if strings.TrimSpace(cfg.DatabaseURL) == "" {
 		problems = append(problems, "DATABASE_URL: must not be empty")
+	}
+	if strings.TrimSpace(cfg.ValkeyURL) == "" {
+		problems = append(problems, "VALKEY_URL: must not be empty")
+	}
+
+	// A stale-claim timeout at or below the delivery timeout would let a
+	// slow-but-healthy delivery be reclaimed and duplicated while it is still
+	// in flight. Catching that here beats discovering it as mysterious
+	// duplicate deliveries under load.
+	if cfg.StaleClaimTimeout > 0 && cfg.DeliveryTimeout > 0 && cfg.StaleClaimTimeout <= cfg.DeliveryTimeout {
+		problems = append(problems, fmt.Sprintf(
+			"STALE_CLAIM_TIMEOUT (%s) must be greater than DELIVERY_TIMEOUT (%s), or in-flight deliveries will be reclaimed and duplicated",
+			cfg.StaleClaimTimeout, cfg.DeliveryTimeout))
+	}
+	// Likewise the lease has to outlast a delivery plus the reclaim sweep, or
+	// the relay would requeue an event the worker is still delivering.
+	if cfg.DeliveryLease > 0 && cfg.DeliveryLease <= cfg.StaleClaimTimeout {
+		problems = append(problems, fmt.Sprintf(
+			"DELIVERY_LEASE (%s) must be greater than STALE_CLAIM_TIMEOUT (%s), or the relay will requeue events the workers still hold",
+			cfg.DeliveryLease, cfg.StaleClaimTimeout))
 	}
 
 	if len(problems) > 0 {
@@ -184,7 +283,32 @@ func (c *Config) Redacted() map[string]any {
 		"db_max_conns":     c.DBMaxConns,
 		"shutdown_timeout": c.ShutdownTimeout.String(),
 		"request_timeout":  c.RequestTimeout.String(),
+
+		"worker_concurrency":     c.WorkerConcurrency,
+		"delivery_timeout":       c.DeliveryTimeout.String(),
+		"max_attempts":           c.MaxAttempts,
+		"retry_base_delay":       c.RetryBaseDelay.String(),
+		"retry_max_delay":        c.RetryMaxDelay.String(),
+		"stale_claim_timeout":    c.StaleClaimTimeout.String(),
+		"relay_poll_interval":    c.RelayPollInterval.String(),
+		"relay_batch_size":       c.RelayBatchSize,
+		"delivery_lease":         c.DeliveryLease.String(),
+		"delivery_dedup_enabled": c.DeliveryDedupEnabled,
+		"delivery_dedup_ttl":     c.DeliveryDedupTTL.String(),
 	}
+}
+
+// envBool parses a boolean environment variable.
+func envBool(key string, def bool) (bool, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return def, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return def, fmt.Errorf("%s: %q is not a boolean (want true/false/1/0)", key, raw)
+	}
+	return v, nil
 }
 
 // redactURL strips the password from a connection URL. Connection strings are

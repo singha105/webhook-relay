@@ -46,10 +46,13 @@ type Behavior struct {
 // "2s", so the control API is usable from curl.
 type Duration time.Duration
 
+// MarshalJSON renders the duration as a string like "2s".
 func (d Duration) MarshalJSON() ([]byte, error) {
 	return json.Marshal(time.Duration(d).String())
 }
 
+// UnmarshalJSON accepts either a duration string ("2s") or a raw nanosecond
+// count, so the control API is usable from curl without knowing which.
 func (d *Duration) UnmarshalJSON(b []byte) error {
 	var s string
 	if err := json.Unmarshal(b, &s); err != nil {
@@ -276,9 +279,10 @@ func (s *Sink) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		Status: status, Note: note,
 	})
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = fmt.Fprintf(w, `{"received":%q,"status":%d}`, eventID, status)
+	// Encoded rather than built with Fprintf: eventID comes from a request
+	// header, so hand-assembling JSON around it would let a caller inject
+	// structure into the response body.
+	writeJSONStatus(w, status, map[string]any{"received": eventID, "status": status})
 }
 
 func (s *Sink) record(r Record) {
@@ -290,7 +294,7 @@ func (s *Sink) record(r Record) {
 func (s *Sink) handleBehavior(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.Behavior())
+		writeJSON(w, s.Behavior())
 	case http.MethodPost, http.MethodPut:
 		var b Behavior
 		if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
@@ -298,19 +302,19 @@ func (s *Sink) handleBehavior(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.SetBehavior(b)
-		writeJSON(w, http.StatusOK, s.Behavior())
+		writeJSON(w, s.Behavior())
 	default:
 		http.Error(w, "GET or POST", http.StatusMethodNotAllowed)
 	}
 }
 
 func (s *Sink) handleRecords(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.Records())
+	writeJSON(w, s.Records())
 }
 
 func (s *Sink) handleReset(w http.ResponseWriter, _ *http.Request) {
 	s.Reset()
-	writeJSON(w, http.StatusOK, map[string]string{"status": "reset"})
+	writeJSON(w, map[string]string{"status": "reset"})
 }
 
 func (s *Sink) handleStats(w http.ResponseWriter, _ *http.Request) {
@@ -319,7 +323,7 @@ func (s *Sink) handleStats(w http.ResponseWriter, _ *http.Request) {
 	for _, r := range records {
 		byEvent[r.EventID]++
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSON(w, map[string]any{
 		"total":            len(records),
 		"distinct_events":  len(byEvent),
 		"per_event":        byEvent,
@@ -328,7 +332,15 @@ func (s *Sink) handleStats(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+// writeJSON writes a 200 response. Control-API handlers only ever succeed or
+// fail with http.Error, so a status parameter would always receive 200.
+func writeJSON(w http.ResponseWriter, v any) {
+	writeJSONStatus(w, http.StatusOK, v)
+}
+
+// writeJSONStatus writes a JSON body with an explicit status, which the webhook
+// handler needs because the whole point is returning the configured code.
+func writeJSONStatus(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)

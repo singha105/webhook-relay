@@ -17,6 +17,11 @@ import (
 )
 
 func main() {
+	// Handled before anything else: the distroless runtime image has no shell
+	// and no curl, so the container healthcheck invokes the binary itself.
+	if handled, code := httpapi.RunSelfCheckFlag("http://127.0.0.1:8080/readyz"); handled {
+		os.Exit(code)
+	}
 	if err := run(); err != nil {
 		// The logger may not exist yet if config failed, so this one goes to
 		// stderr directly.

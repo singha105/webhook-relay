@@ -17,12 +17,14 @@ import (
 // resource).
 var ErrEndpointNotFound = fmt.Errorf("endpoint does not exist")
 
-const eventColumns = `id, endpoint_id, event_type, payload, status, idempotency_key, created_at`
+const eventColumns = `id, endpoint_id, event_type, payload, status, idempotency_key,
+	created_at, attempt_count, next_retry_at`
 
 func scanEvent(row pgx.Row) (*models.Event, error) {
 	var e models.Event
 	var payload []byte
-	err := row.Scan(&e.ID, &e.EndpointID, &e.EventType, &payload, &e.Status, &e.IdempotencyKey, &e.CreatedAt)
+	err := row.Scan(&e.ID, &e.EndpointID, &e.EventType, &payload, &e.Status,
+		&e.IdempotencyKey, &e.CreatedAt, &e.AttemptCount, &e.NextRetryAt)
 	if err != nil {
 		if isNoRows(err) {
 			return nil, models.ErrNotFound
@@ -101,26 +103,31 @@ func (s *Store) GetEventWithAttempts(ctx context.Context, id uuid.UUID) (*models
 	return &models.EventWithAttempts{Event: *event, Attempts: attempts}, nil
 }
 
-// ListPendingEventsForEndpoint returns the oldest pending events for one
-// endpoint. This is the query the schema's partial index
-// events (endpoint_id, created_at) WHERE status='pending' exists to serve:
-// the index supplies both the filter and the ordering, so the plan is an index
-// scan with no sort node and LIMIT short-circuits it.
+// ListDueEventsForEndpoint returns the events for one endpoint that are ready
+// for delivery, soonest first.
 //
-// Day 2's worker will need FOR UPDATE SKIP LOCKED here (or to consume from
-// Valkey instead). Today nothing claims events, so this is a plain read used
-// by tests and by the seed script.
-func (s *Store) ListPendingEventsForEndpoint(ctx context.Context, endpointID uuid.UUID, limit int) ([]models.Event, error) {
+// Served by events_due_by_endpoint_idx: endpoint_id leads because it is the
+// equality predicate, next_retry_at follows so it supplies the ORDER BY and
+// LIMIT can short-circuit without a sort.
+//
+// 'failed' is included alongside 'pending' because an event awaiting its third
+// retry sits in 'failed' — filtering on 'pending' alone, as the day-1 version
+// did, would have silently hidden every event that had ever been attempted.
+// This is a read-only view for operators and tests; the relay claims work
+// through ClaimDueEvents, which locks.
+func (s *Store) ListDueEventsForEndpoint(ctx context.Context, endpointID uuid.UUID, limit int) ([]models.Event, error) {
 	const q = `
 		SELECT ` + eventColumns + `
 		FROM events
-		WHERE endpoint_id = $1 AND status = 'pending'
-		ORDER BY created_at
+		WHERE endpoint_id = $1
+		  AND status IN ('pending', 'failed')
+		  AND next_retry_at <= now()
+		ORDER BY next_retry_at
 		LIMIT $2`
 
 	rows, err := s.pool.Query(ctx, q, endpointID, limit)
 	if err != nil {
-		return nil, fmt.Errorf("list pending events: %w", err)
+		return nil, fmt.Errorf("list due events: %w", err)
 	}
 	defer rows.Close()
 
@@ -128,14 +135,15 @@ func (s *Store) ListPendingEventsForEndpoint(ctx context.Context, endpointID uui
 	for rows.Next() {
 		var e models.Event
 		var payload []byte
-		if err := rows.Scan(&e.ID, &e.EndpointID, &e.EventType, &payload, &e.Status, &e.IdempotencyKey, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.EndpointID, &e.EventType, &payload, &e.Status,
+			&e.IdempotencyKey, &e.CreatedAt, &e.AttemptCount, &e.NextRetryAt); err != nil {
 			return nil, fmt.Errorf("scan event: %w", err)
 		}
 		e.Payload = json.RawMessage(payload)
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list pending events: %w", err)
+		return nil, fmt.Errorf("list due events: %w", err)
 	}
 	return out, nil
 }

@@ -132,3 +132,100 @@ func TestRedactURLWithoutCredentials(t *testing.T) {
 		t.Errorf("redactURL(%q) = %q, want unchanged", in, got)
 	}
 }
+
+func TestLoadDeliveryDefaults(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() = %v", err)
+	}
+	if cfg.WorkerConcurrency != defaultWorkerConcurrency {
+		t.Errorf("WorkerConcurrency = %d, want %d", cfg.WorkerConcurrency, defaultWorkerConcurrency)
+	}
+	if cfg.MaxAttempts != defaultMaxAttempts {
+		t.Errorf("MaxAttempts = %d, want %d", cfg.MaxAttempts, defaultMaxAttempts)
+	}
+	// The dedup guard must default ON. Day 5 turns it off explicitly; it must
+	// never be off because someone forgot to set it.
+	if !cfg.DeliveryDedupEnabled {
+		t.Error("DeliveryDedupEnabled defaults to false; it must default to true")
+	}
+}
+
+func TestDeliveryDedupCanBeDisabled(t *testing.T) {
+	for _, raw := range []string{"false", "0", "FALSE"} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv("DELIVERY_DEDUP_ENABLED", raw)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() = %v", err)
+			}
+			if cfg.DeliveryDedupEnabled {
+				t.Errorf("DELIVERY_DEDUP_ENABLED=%s did not disable the guard", raw)
+			}
+		})
+	}
+
+	t.Run("a non-boolean is rejected", func(t *testing.T) {
+		t.Setenv("DELIVERY_DEDUP_ENABLED", "maybe")
+		if _, err := Load(); err == nil {
+			t.Error("Load() = nil, want an error for a non-boolean")
+		}
+	})
+}
+
+// These two relationships are the difference between a working system and one
+// that duplicates deliveries under load, so they are validated at boot rather
+// than left to be discovered in production.
+func TestLoadRejectsTimeoutOrderingMistakes(t *testing.T) {
+	t.Run("stale claim timeout must exceed the delivery timeout", func(t *testing.T) {
+		t.Setenv("DELIVERY_TIMEOUT", "30s")
+		t.Setenv("STALE_CLAIM_TIMEOUT", "10s")
+		_, err := Load()
+		if err == nil {
+			t.Fatal("Load() = nil, want an error")
+		}
+		if !strings.Contains(err.Error(), "STALE_CLAIM_TIMEOUT") {
+			t.Errorf("error does not name the offending variable: %v", err)
+		}
+		if !strings.Contains(err.Error(), "duplicated") {
+			t.Errorf("error does not explain the consequence: %v", err)
+		}
+	})
+
+	t.Run("the lease must exceed the stale claim timeout", func(t *testing.T) {
+		t.Setenv("DELIVERY_TIMEOUT", "10s")
+		t.Setenv("STALE_CLAIM_TIMEOUT", "60s")
+		t.Setenv("DELIVERY_LEASE", "30s")
+		_, err := Load()
+		if err == nil {
+			t.Fatal("Load() = nil, want an error")
+		}
+		if !strings.Contains(err.Error(), "DELIVERY_LEASE") {
+			t.Errorf("error does not name the offending variable: %v", err)
+		}
+	})
+
+	t.Run("the documented defaults satisfy both", func(t *testing.T) {
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("the default configuration is invalid: %v", err)
+		}
+		if cfg.StaleClaimTimeout <= cfg.DeliveryTimeout {
+			t.Error("default StaleClaimTimeout does not exceed DeliveryTimeout")
+		}
+		if cfg.DeliveryLease <= cfg.StaleClaimTimeout {
+			t.Error("default DeliveryLease does not exceed StaleClaimTimeout")
+		}
+	})
+}
+
+func TestLoadRejectsBadWorkerConcurrency(t *testing.T) {
+	for _, v := range []string{"0", "-1", "100000", "lots"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("WORKER_CONCURRENCY", v)
+			if _, err := Load(); err == nil {
+				t.Errorf("Load() = nil, want an error for WORKER_CONCURRENCY=%s", v)
+			}
+		})
+	}
+}
