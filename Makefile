@@ -18,8 +18,10 @@ POSTGRES_PORT ?= $(shell [ -f .env ] && grep -E '^POSTGRES_PORT=' .env | cut -d=
 POSTGRES_PORT := $(if $(POSTGRES_PORT),$(POSTGRES_PORT),5432)
 VALKEY_PORT   ?= $(shell [ -f .env ] && grep -E '^VALKEY_PORT=' .env | cut -d= -f2 || true)
 VALKEY_PORT   := $(if $(VALKEY_PORT),$(VALKEY_PORT),6379)
+SINK_PORT     ?= $(shell [ -f .env ] && grep -E '^SINK_PORT=' .env | cut -d= -f2 || true)
+SINK_PORT     := $(if $(SINK_PORT),$(SINK_PORT),9090)
 
-export API_PORT POSTGRES_PORT VALKEY_PORT
+export API_PORT POSTGRES_PORT VALKEY_PORT SINK_PORT
 
 API_URL       ?= http://localhost:$(API_PORT)
 GO            ?= go
@@ -91,6 +93,23 @@ down: ## Stop the stack and delete its volumes
 .PHONY: logs
 logs: ## Follow the API logs
 	$(COMPOSE) logs -f api
+
+.PHONY: worker-logs
+worker-logs: ## Follow the delivery worker logs
+	$(COMPOSE) logs -f worker
+
+.PHONY: demo-up
+demo-up: ## Start the stack plus the controllable test sink
+	$(COMPOSE) --profile demo up -d --build
+	@$(MAKE) --no-print-directory wait
+	@echo ""
+	@echo "  stack + sink are up."
+	@echo "    api:  $(API_URL)"
+	@echo "    sink: http://localhost:$(SINK_PORT)   (control: /_control/behavior, /_control/stats)"
+
+.PHONY: demo
+demo: ## Run the day-2 delivery demonstration end to end
+	@./scripts/demo-delivery.sh
 
 .PHONY: ps
 ps: ## Show stack status
