@@ -104,6 +104,34 @@ func NewValkeyQueue(ctx context.Context, cfg ValkeyConfig) (*ValkeyQueue, error)
 	return q, nil
 }
 
+// errNoGroup is the error Valkey returns when the stream or the consumer group
+// does not exist.
+//
+// It is matched by substring because go-redis surfaces it as a plain error
+// string rather than a typed value. Fragile in principle; the alternative —
+// treating every claim error as possibly-NOGROUP and blindly recreating the
+// group — would paper over real failures.
+const errNoGroup = "NOGROUP"
+
+// recoverGroup recreates the consumer group after it has vanished.
+//
+// This is not hypothetical. A Valkey restart without persistence, a flushed
+// database, or an operator running FLUSHALL all destroy the stream and its
+// group. Without this the workers wedge permanently: XREADGROUP returns NOGROUP
+// forever, delivery stops silently, and the only symptom is a log line — while
+// the relay happily keeps enqueueing, because XADD recreates the stream but not
+// the group.
+//
+// Found the hard way: flushing Valkey mid-demo stopped delivery entirely and
+// the workers never recovered on their own.
+func (q *ValkeyQueue) recoverGroup(ctx context.Context, cause error) bool {
+	if cause == nil || !strings.Contains(cause.Error(), errNoGroup) {
+		return false
+	}
+	// MKSTREAM from "0" — see ensureGroup for why the start id matters.
+	return q.ensureGroup(ctx) == nil
+}
+
 // ensureGroup creates the consumer group, tolerating the case where another
 // replica created it first.
 //
@@ -158,13 +186,21 @@ func (q *ValkeyQueue) Enqueue(ctx context.Context, eventID uuid.UUID) error {
 // context cancellation until it returns, which makes shutdown ragged. The
 // worker owns its own poll interval instead.
 func (q *ValkeyQueue) Claim(ctx context.Context, consumerID string, count int) ([]ClaimedMessage, error) {
-	streams, err := q.client.XReadGroup(ctx, &redis.XReadGroupArgs{
-		Group:    q.group,
-		Consumer: consumerID,
-		Streams:  []string{q.stream, ">"}, // ">" = entries never delivered to anyone
-		Count:    int64(count),
-		Block:    -1, // no blocking
-	}).Result()
+	read := func() ([]redis.XStream, error) {
+		return q.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    q.group,
+			Consumer: consumerID,
+			Streams:  []string{q.stream, ">"}, // ">" = entries never delivered to anyone
+			Count:    int64(count),
+			Block:    -1, // no blocking
+		}).Result()
+	}
+
+	streams, err := read()
+	if err != nil && q.recoverGroup(ctx, err) {
+		// The group was recreated; retry once. A second failure is real.
+		streams, err = read()
+	}
 
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
@@ -237,14 +273,22 @@ const nackParkingConsumer = "nacked"
 // This is the recovery path for a worker killed mid-delivery. XAUTOCLAIM walks
 // the pending list, so it is the mechanism a plain LIST cannot offer.
 func (q *ValkeyQueue) ReclaimStale(ctx context.Context, consumerID string, idleTimeout time.Duration, count int) ([]ClaimedMessage, error) {
-	msgs, _, err := q.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
-		Stream:   q.stream,
-		Group:    q.group,
-		Consumer: consumerID,
-		MinIdle:  idleTimeout,
-		Start:    "0-0",
-		Count:    int64(count),
-	}).Result()
+	autoClaim := func() ([]redis.XMessage, error) {
+		msgs, _, err := q.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+			Stream:   q.stream,
+			Group:    q.group,
+			Consumer: consumerID,
+			MinIdle:  idleTimeout,
+			Start:    "0-0",
+			Count:    int64(count),
+		}).Result()
+		return msgs, err
+	}
+
+	msgs, err := autoClaim()
+	if err != nil && q.recoverGroup(ctx, err) {
+		msgs, err = autoClaim()
+	}
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return nil, ErrEmpty
@@ -293,7 +337,9 @@ func (q *ValkeyQueue) deliveryCount(ctx context.Context, messageID string) (int6
 func (q *ValkeyQueue) Depth(ctx context.Context) (int64, error) {
 	groups, err := q.client.XInfoGroups(ctx, q.stream).Result()
 	if err != nil {
-		if errors.Is(err, redis.Nil) {
+		// A missing stream is a depth of zero, not an error: it simply means
+		// nothing has been enqueued since it was last trimmed away.
+		if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("queue depth: %w", err)
@@ -382,3 +428,7 @@ func toClaimedMessage(msg redis.XMessage, deliveryCount int64) (ClaimedMessage, 
 
 // compile-time check
 var _ Queue = (*ValkeyQueue)(nil)
+
+// StreamKeyFor exposes a queue's stream key. Used by tests that need to
+// manipulate the underlying stream directly to simulate a Valkey wipe.
+func StreamKeyFor(q *ValkeyQueue) string { return q.stream }

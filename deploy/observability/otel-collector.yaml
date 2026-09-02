@@ -1,0 +1,56 @@
+# OpenTelemetry Collector.
+#
+# The service pushes traces here over OTLP; the collector forwards them to
+# Tempo. Metrics do NOT flow through here — Prometheus scrapes the services
+# directly, because pull gives you `up` as a free liveness signal and keeps the
+# collector off the critical path for the dashboard.
+#
+# Why have a collector at all if it only relays traces: it is the seam. Changing
+# where traces go, adding sampling, or scrubbing an attribute becomes a config
+# change here rather than a redeploy of every service.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Bounds collector memory. Without it a burst of spans can OOM the collector,
+  # which then loses the traces from the incident that caused the burst — the
+  # exact moment you need them.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 20
+
+  batch:
+    timeout: 2s
+    send_batch_size: 512
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    traces:
+      receivers: [otlp]
+      # memory_limiter must come first: it can only shed load if it sees the
+      # data before the batcher has buffered it.
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo]

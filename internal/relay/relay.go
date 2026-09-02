@@ -35,6 +35,7 @@ import (
 
 	"github.com/singha105/webhook-relay/internal/queue"
 	"github.com/singha105/webhook-relay/internal/store"
+	"github.com/singha105/webhook-relay/internal/telemetry"
 )
 
 // Defaults.
@@ -142,17 +143,29 @@ func (r *Relay) Run(ctx context.Context) error {
 
 // relayOnce claims one batch and enqueues it, returning how many were claimed.
 func (r *Relay) relayOnce(ctx context.Context) (int, error) {
-	ids, err := r.store.ClaimDueEvents(ctx, r.cfg.BatchSize, r.cfg.Lease)
+	due, err := r.store.ClaimDueEvents(ctx, r.cfg.BatchSize, r.cfg.Lease)
 	if err != nil {
 		return 0, err
 	}
-	if len(ids) == 0 {
+	if len(due) == 0 {
 		return 0, nil
 	}
 
 	enqueued := 0
-	for _, id := range ids {
-		if err := r.queue.Enqueue(ctx, id); err != nil {
+	for _, ev := range due {
+		id := ev.ID
+
+		// Rehydrate the trace context that was captured at ingest. The relay
+		// has no in-process link to that request — it is a background poller
+		// reading rows written minutes ago — so this is the only way the
+		// delivery ends up in the same trace as the ingest that created it.
+		//
+		// A span here would be noise (the relay is a poll loop, not a unit of
+		// work), so the context is passed through for Enqueue to inject into
+		// the message and nothing more.
+		enqueueCtx := telemetry.ExtractContext(ctx, ev.TraceContext)
+
+		if err := r.queue.Enqueue(enqueueCtx, id); err != nil {
 			if ctx.Err() != nil {
 				// Shutting down. The remaining events keep their lease and
 				// will be requeued when it expires; nothing is lost. The
@@ -182,10 +195,10 @@ func (r *Relay) relayOnce(ctx context.Context) (int, error) {
 	}
 
 	r.logger.Debug("relayed a batch",
-		slog.Int("claimed", len(ids)),
+		slog.Int("claimed", len(due)),
 		slog.Int("enqueued", enqueued),
 	)
-	return len(ids), nil
+	return len(due), nil
 }
 
 // sweepExpiredLeases returns abandoned events to the ready set.

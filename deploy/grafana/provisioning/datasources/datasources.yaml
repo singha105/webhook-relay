@@ -1,0 +1,50 @@
+# Datasources are provisioned, not clicked. A dashboard that requires someone to
+# wire up three datasources before it renders is a dashboard nobody sees.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+      # Lets Grafana turn an exemplar on a latency panel into a link straight
+      # to the trace in Tempo — the single most useful navigation in this
+      # stack, and the reason exemplars are enabled at all.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      # Pivot from a span to the logs emitted during it. Every log line carries
+      # trace_id, which is what makes this work.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -5m
+        spanEndTimeShift: 5m
+        filterByTraceID: true
+      nodeGraph:
+        enabled: true
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      derivedFields:
+        # The reverse pivot: click a trace_id in a log line, land on the trace.
+        - name: TraceID
+          matcherType: label
+          matcherRegex: trace_id
+          url: "$${__value.raw}"
+          datasourceUid: tempo

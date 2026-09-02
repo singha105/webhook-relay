@@ -1,0 +1,16 @@
+apiVersion: 1
+
+providers:
+  - name: webhook-relay
+    orgId: 1
+    folder: webhook-relay
+    type: file
+    disableDeletion: false
+    # The JSON on disk is the source of truth. Edits made in the UI are
+    # overwritten on reload, which is the point: the dashboard is code, and
+    # a change that is not committed does not survive a restart.
+    allowUiUpdates: false
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

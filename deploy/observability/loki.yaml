@@ -1,0 +1,50 @@
+# Loki, single-binary mode with filesystem storage.
+#
+# Logs are shipped by the Docker driver rather than by the application, so the
+# service writes plain JSON to stdout and knows nothing about Loki. That keeps
+# log shipping a deployment concern instead of a code dependency — the same
+# binary runs unchanged under systemd, Kubernetes, or `go run`.
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9095
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Containers can emit slightly out-of-order timestamps under load; rejecting
+  # those would silently drop exactly the logs from a busy moment.
+  reject_old_samples: false
+  retention_period: 24h
+  allow_structured_metadata: true
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+
+analytics:
+  reporting_enabled: false

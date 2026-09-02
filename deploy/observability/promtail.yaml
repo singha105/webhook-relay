@@ -1,0 +1,70 @@
+# Promtail ships container logs into Loki.
+#
+# Discovery is over the Docker API rather than the Loki logging driver, which
+# would require `docker plugin install` before `make up` worked — breaking the
+# one-command promise. This way the whole stack is just compose.
+#
+# The service itself knows nothing about Loki: it writes JSON to stdout, and log
+# shipping stays a deployment concern. The same binary runs unchanged under
+# systemd, Kubernetes, or `go run`.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+
+    relabel_configs:
+      - source_labels: ["__meta_docker_container_label_com_docker_compose_project"]
+        regex: "webhook-relay"
+        action: keep
+
+      # Drop the observability stack's own logs. Shipping Loki's output into
+      # Loki is a genuine feedback loop — every ingest logs, which produces a
+      # log to ingest — and Grafana, Tempo and Prometheus are all noise that
+      # would bury the two services anyone is actually reading.
+      - source_labels: ["__meta_docker_container_label_com_docker_compose_service"]
+        regex: "(loki|promtail|grafana|tempo|prometheus|otel-collector)"
+        action: drop
+      - source_labels: ["__meta_docker_container_label_com_docker_compose_service"]
+        target_label: "service"
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: "container"
+
+    pipeline_stages:
+      # The api and worker emit structured JSON, so lift the fields that make
+      # logs navigable. Anything that is not JSON — Postgres, Valkey — falls
+      # through untouched rather than erroring.
+      - json:
+          expressions:
+            level: level
+            msg: msg
+            trace_id: trace_id
+            event_id: event_id
+            endpoint_id: endpoint_id
+          drop_malformed: false
+
+      # level as a label: low cardinality, and the first thing anyone filters
+      # on. trace_id and event_id are deliberately NOT labels — they are
+      # unbounded, and one Loki stream per event would be catastrophic. They go
+      # in structured metadata instead, which is indexed for lookup without
+      # creating streams.
+      - labels:
+          level:
+
+      - structured_metadata:
+          trace_id:
+          event_id:
+          endpoint_id:

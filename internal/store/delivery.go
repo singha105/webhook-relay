@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -52,7 +53,16 @@ import (
 //
 // SKIP LOCKED is what lets several relay replicas run concurrently: each takes
 // a disjoint set of rows instead of blocking on the same ones.
-func (s *Store) ClaimDueEvents(ctx context.Context, limit int, lease time.Duration) ([]uuid.UUID, error) {
+// DueEvent is a claimed event plus the trace context captured at ingest.
+type DueEvent struct {
+	ID uuid.UUID
+	// TraceContext is the W3C carrier stored when the event was ingested. Nil
+	// when the event predates tracing or tracing was disabled, in which case
+	// the delivery starts a fresh root rather than failing.
+	TraceContext map[string]string
+}
+
+func (s *Store) ClaimDueEvents(ctx context.Context, limit int, lease time.Duration) ([]DueEvent, error) {
 	const q = `
 		WITH due AS (
 			SELECT id
@@ -68,7 +78,7 @@ func (s *Store) ClaimDueEvents(ctx context.Context, limit int, lease time.Durati
 		    next_retry_at = now() + $2::interval
 		FROM due
 		WHERE e.id = due.id
-		RETURNING e.id`
+		RETURNING e.id, e.trace_context`
 
 	rows, err := s.pool.Query(ctx, q, limit, lease.String())
 	if err != nil {
@@ -76,13 +86,22 @@ func (s *Store) ClaimDueEvents(ctx context.Context, limit int, lease time.Durati
 	}
 	defer rows.Close()
 
-	out := make([]uuid.UUID, 0, limit)
+	out := make([]DueEvent, 0, limit)
 	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		var (
+			id       uuid.UUID
+			rawTrace []byte
+		)
+		if err := rows.Scan(&id, &rawTrace); err != nil {
 			return nil, fmt.Errorf("scan claimed event: %w", err)
 		}
-		out = append(out, id)
+		due := DueEvent{ID: id}
+		if len(rawTrace) > 0 {
+			// A corrupt carrier must not stop delivery: the event still goes
+			// out, just as the root of its own trace.
+			_ = json.Unmarshal(rawTrace, &due.TraceContext)
+		}
+		out = append(out, due)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("claim due events: %w", err)

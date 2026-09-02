@@ -1,0 +1,90 @@
+# Recording and alerting rules.
+#
+# The recording rules exist because the SLO query is expensive to evaluate over
+# 7 days on raw data, and because a dashboard panel and an alert that compute
+# the SLO differently will eventually disagree — at which point nobody trusts
+# either. One definition, recorded once, read by both.
+
+groups:
+  - name: webhook-relay-slo
+    interval: 30s
+    rules:
+      # The SLI: the proportion of delivery attempts that succeeded.
+      # Recorded as a ratio so the burn-rate rules below can divide by the
+      # error budget without repeating the expression.
+      - record: webhook:delivery_success:ratio_rate5m
+        expr: |
+          sum(rate(webhook_delivery_attempts_total{status_class="2xx"}[5m]))
+          /
+          clamp_min(sum(rate(webhook_delivery_attempts_total[5m])), 1e-9)
+
+      - record: webhook:delivery_success:ratio_rate1h
+        expr: |
+          sum(rate(webhook_delivery_attempts_total{status_class="2xx"}[1h]))
+          /
+          clamp_min(sum(rate(webhook_delivery_attempts_total[1h])), 1e-9)
+
+      # The latency SLI: the fraction of deliveries completing inside 30s.
+      # Read from the histogram's cumulative buckets rather than from a
+      # quantile, because a quantile cannot answer "what fraction met the
+      # target" — only "what is the value at rank p".
+      - record: webhook:delivery_within_slo:ratio_rate5m
+        expr: |
+          sum(rate(webhook_delivery_duration_seconds_bucket{le="10.0"}[5m]))
+          /
+          clamp_min(sum(rate(webhook_delivery_duration_seconds_count[5m])), 1e-9)
+
+  - name: webhook-relay-alerts
+    rules:
+      # The SLO metric that matters. A growing backlog is the first thing a
+      # customer notices, and it leads every other symptom.
+      - alert: WebhookBacklogAgeHigh
+        expr: max(webhook_queue_oldest_message_age_seconds) > 30
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oldest undelivered event is over the 30s SLO target"
+          description: "Oldest event has been waiting {{ $value | humanizeDuration }}. The SLO is 99% delivered within 30s."
+
+      - alert: WebhookBacklogAgeCritical
+        expr: max(webhook_queue_oldest_message_age_seconds) > 300
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Delivery backlog is five minutes deep"
+          description: "Oldest event has been waiting {{ $value | humanizeDuration }}. Error budget is burning fast."
+
+      - alert: WebhookCircuitBreakerOpen
+        expr: webhook_circuit_breaker_state == 2
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker open for endpoint {{ $labels.endpoint_id }}"
+          description: "Deliveries to this endpoint are being skipped entirely."
+
+      - alert: WebhookDLQRateHigh
+        expr: sum(rate(webhook_events_dlq_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Events are being dead-lettered"
+          description: "{{ $value | humanize }} events/s are exhausting their retries or failing permanently."
+
+      # Fires when the 5-minute success ratio would exhaust a 30-day budget in
+      # under two days. Multi-window burn rate is the standard way to be
+      # sensitive to a real outage without paging on a single bad minute.
+      - alert: WebhookErrorBudgetBurningFast
+        expr: |
+          (1 - webhook:delivery_success:ratio_rate5m) > (14.4 * 0.01)
+          and
+          (1 - webhook:delivery_success:ratio_rate1h) > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Burning the 99% delivery error budget 14x faster than sustainable"
+          description: "At this rate a 30-day budget is gone in about two days."

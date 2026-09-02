@@ -149,8 +149,12 @@ return {1, 'closed', 0}
 var recordFailureScript = redis.NewScript(`
 local state_key = KEYS[1]
 local probe_key = KEYS[2]
-local threshold = tonumber(ARGV[1])
-local ttl_s     = tonumber(ARGV[2])
+local threshold   = tonumber(ARGV[1])
+local ttl_s       = tonumber(ARGV[2])
+-- Recorded with the state so that any process reading this breaker computes
+-- the half-open transition from the SAME cooldown the opener used, rather than
+-- from its own configuration.
+local cooldown_ms = tonumber(ARGV[3])
 
 local t      = redis.call('TIME')
 local now_ms = (tonumber(t[1]) * 1000) + math.floor(tonumber(t[2]) / 1000)
@@ -162,7 +166,7 @@ local failures = redis.call('HINCRBY', state_key, 'failures', 1)
 -- the threshold to be reached again would mean a still-broken endpoint gets
 -- another full round of traffic after every single cooldown.
 if state == 'half_open' then
-  redis.call('HSET', state_key, 'state', 'open', 'opened_at', now_ms)
+  redis.call('HSET', state_key, 'state', 'open', 'opened_at', now_ms, 'cooldown_ms', cooldown_ms)
   redis.call('DEL', probe_key)
   redis.call('EXPIRE', state_key, ttl_s)
   return {failures, 'open'}
@@ -170,7 +174,7 @@ end
 
 if failures >= threshold then
   if state ~= 'open' then
-    redis.call('HSET', state_key, 'state', 'open', 'opened_at', now_ms)
+    redis.call('HSET', state_key, 'state', 'open', 'opened_at', now_ms, 'cooldown_ms', cooldown_ms)
   end
   redis.call('EXPIRE', state_key, ttl_s)
   return {failures, 'open'}
@@ -290,7 +294,7 @@ func (b *Breaker) RecordFailure(ctx context.Context, endpointID uuid.UUID) (Stat
 
 	res, err := recordFailureScript.Run(ctx, b.client,
 		[]string{stateKey(endpointID), probeKey(endpointID)},
-		b.threshold, ttl,
+		b.threshold, ttl, b.cooldown.Milliseconds(),
 	).Slice()
 	if err != nil {
 		return StateClosed, 0, fmt.Errorf("breaker record failure for endpoint %s: %w", endpointID, err)
@@ -315,7 +319,7 @@ func (b *Breaker) Current(ctx context.Context, endpointID uuid.UUID) (State, err
 		return StateClosed, nil
 	}
 
-	vals, err := b.client.HMGet(ctx, stateKey(endpointID), "state", "opened_at").Result()
+	vals, err := b.client.HMGet(ctx, stateKey(endpointID), "state", "opened_at", "cooldown_ms").Result()
 	if err != nil {
 		return StateClosed, fmt.Errorf("breaker state for endpoint %s: %w", endpointID, err)
 	}
@@ -341,11 +345,27 @@ func (b *Breaker) Current(ctx context.Context, endpointID uuid.UUID) (State, err
 		//nolint:nilerr // deliberate: degrade to the raw state, do not fail
 		return state, nil
 	}
+	// Prefer the cooldown recorded when the breaker opened, falling back to
+	// this process's own configuration for state written by an older version.
+	//
+	// This matters more than it looks. Without it, Current() answers using the
+	// READER's cooldown, so an API configured for 5m and a worker configured
+	// for 30s report different states for the same breaker — the API says
+	// "open" while the worker is already admitting probes. An operator
+	// watching the dashboard would conclude the breaker was stuck.
+	cooldown := b.cooldown
+	if raw, ok := vals[2].(string); ok && raw != "" {
+		var ms int64
+		if _, err := fmt.Sscanf(raw, "%d", &ms); err == nil && ms > 0 {
+			cooldown = time.Duration(ms) * time.Millisecond
+		}
+	}
+
 	// Report half_open once the cooldown has elapsed, even though no probe has
 	// been taken yet: that is what the breaker will do on the next call, and a
 	// dashboard showing "open" for an endpoint that is about to be probed is
 	// misleading.
-	if time.Since(time.UnixMilli(openedMS)) >= b.cooldown {
+	if time.Since(time.UnixMilli(openedMS)) >= cooldown {
 		return StateHalfOpen, nil
 	}
 	return StateOpen, nil

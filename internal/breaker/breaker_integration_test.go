@@ -369,3 +369,49 @@ func TestStateNumericIsStable(t *testing.T) {
 		}
 	}
 }
+
+// Two processes configured with different cooldowns must report the SAME state
+// for one breaker. Without storing the cooldown alongside the state, Current()
+// answers from the reader's own configuration — so an API on a 5m cooldown says
+// "open" while a worker on 30s is already admitting probes, and an operator
+// watching the dashboard concludes the breaker is stuck.
+func TestStateIsConsistentAcrossDifferentlyConfiguredReaders(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	client := test.NewRedisClient(t)
+	endpoint := uuid.New()
+
+	shortCooldown := 200 * time.Millisecond
+	opener := breaker.New(client, breaker.Config{Threshold: 2, Cooldown: shortCooldown, Enabled: true})
+	// A second process on a much longer cooldown, as a misconfigured or
+	// mid-rollout deployment would be.
+	reader := breaker.New(client, breaker.Config{Threshold: 2, Cooldown: time.Hour, Enabled: true})
+
+	for i := 0; i < 2; i++ {
+		if _, _, err := opener.RecordFailure(ctx, endpoint); err != nil {
+			t.Fatalf("RecordFailure() = %v", err)
+		}
+	}
+
+	if state, _ := reader.Current(ctx, endpoint); state != breaker.StateOpen {
+		t.Errorf("reader sees %q immediately after opening, want open", state)
+	}
+
+	time.Sleep(shortCooldown + 100*time.Millisecond)
+
+	openerState, err := opener.Current(ctx, endpoint)
+	if err != nil {
+		t.Fatalf("Current() = %v", err)
+	}
+	readerState, err := reader.Current(ctx, endpoint)
+	if err != nil {
+		t.Fatalf("Current() = %v", err)
+	}
+	if openerState != breaker.StateHalfOpen {
+		t.Errorf("the opener sees %q after its cooldown, want half_open", openerState)
+	}
+	if readerState != openerState {
+		t.Errorf("reader sees %q but opener sees %q — the two disagree about the same breaker",
+			readerState, openerState)
+	}
+}

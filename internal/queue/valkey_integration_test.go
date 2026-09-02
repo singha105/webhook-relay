@@ -372,3 +372,62 @@ func TestLenCountsEveryEntry(t *testing.T) {
 		t.Errorf("Len() = %d, want 4 — acked entries remain in the stream until trimmed", length)
 	}
 }
+
+// A Valkey restart without persistence, a flushed database, or an operator
+// running FLUSHALL all destroy the stream and its consumer group. Before this
+// was handled, every worker wedged permanently on NOGROUP: delivery stopped
+// silently while the relay kept enqueueing, because XADD recreates the stream
+// but not the group.
+//
+// Day 5 deletes the Valkey pod on purpose, so this path is load-bearing.
+func TestQueueRecoversFromALostConsumerGroup(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	q := test.NewQueue(t)
+	client := test.NewRedisClient(t)
+
+	// Normal operation first, so the group definitely exists.
+	if err := q.Enqueue(ctx, uuid.New()); err != nil {
+		t.Fatalf("Enqueue() = %v", err)
+	}
+	msgs, err := q.Claim(ctx, "c1", 10)
+	if err != nil {
+		t.Fatalf("Claim() = %v", err)
+	}
+	for _, m := range msgs {
+		_ = q.Ack(ctx, m.MessageID)
+	}
+
+	// Destroy the stream, exactly as a wiped Valkey would.
+	if err := client.Del(ctx, queue.StreamKeyFor(q)).Err(); err != nil {
+		t.Fatalf("deleting the stream: %v", err)
+	}
+
+	// The relay carries on enqueueing; XADD recreates the stream but not the
+	// consumer group.
+	want := uuid.New()
+	if err := q.Enqueue(ctx, want); err != nil {
+		t.Fatalf("Enqueue() after the flush = %v", err)
+	}
+
+	// The worker must recover on its own rather than looping on NOGROUP.
+	var got []queue.ClaimedMessage
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err = q.Claim(ctx, "c1", 10)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, queue.ErrEmpty) {
+			t.Fatalf("Claim() after the flush = %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(got) == 0 {
+		t.Fatal("the worker never recovered after the consumer group was destroyed")
+	}
+	if got[0].EventID != want {
+		t.Errorf("recovered event %s, want %s", got[0].EventID, want)
+	}
+	_ = q.Ack(ctx, got[0].MessageID)
+}
