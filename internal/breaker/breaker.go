@@ -335,6 +335,10 @@ func (b *Breaker) Current(ctx context.Context, endpointID uuid.UUID) (State, err
 	}
 	var openedMS int64
 	if _, err := fmt.Sscanf(openedAt, "%d", &openedMS); err != nil {
+		// An unparseable opened_at is not worth failing a status read over:
+		// report the stored state as-is rather than returning an error that
+		// would blank the field on a dashboard.
+		//nolint:nilerr // deliberate: degrade to the raw state, do not fail
 		return state, nil
 	}
 	// Report half_open once the cooldown has elapsed, even though no probe has

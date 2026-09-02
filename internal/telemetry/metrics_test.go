@@ -27,7 +27,7 @@ func newMetrics(t *testing.T) *telemetry.Metrics {
 func scrape(t *testing.T, m *telemetry.Metrics) string {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/metrics", nil)
+	req := httptest.NewRequestWithContext(context.Background(), "GET", "/metrics", nil)
 	// OpenMetrics is what carries exemplars; the default text format drops them.
 	req.Header.Set("Accept", "application/openmetrics-text; version=1.0.0")
 	m.Handler().ServeHTTP(rec, req)

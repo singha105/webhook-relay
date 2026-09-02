@@ -86,6 +86,21 @@ func (s *Server) getEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r, err, "get_endpoint")
 		return
 	}
+
+	// The breaker state is read live rather than stored, and a failure to read
+	// it leaves the field absent rather than defaulting to "closed" — an
+	// operator must be able to tell "this endpoint is healthy" from "we could
+	// not find out".
+	if s.breaker != nil {
+		state, brkErr := s.breaker.Current(r.Context(), id)
+		if brkErr != nil {
+			LoggerFrom(r.Context()).Warn("could not read circuit breaker state",
+				slog.String("endpoint_id", id.String()), slog.Any("error", brkErr))
+		} else {
+			endpoint.CircuitBreakerState = string(state)
+		}
+	}
+
 	writeJSON(w, r, http.StatusOK, endpoint)
 }
 

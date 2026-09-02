@@ -9,6 +9,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/singha105/webhook-relay/internal/telemetry"
 )
 
 // Stream and group names. Valkey is protocol-compatible with Redis, so the
@@ -20,9 +22,16 @@ const (
 	// GroupName is the single consumer group. Every worker joins it, so each
 	// entry goes to exactly one worker rather than being fanned out.
 	GroupName = "delivery-workers"
-	// fieldEventID is the only field written per entry.
+	// fieldEventID identifies the event to deliver.
 	fieldEventID = "event_id"
 )
+
+// traceFieldPrefix namespaces propagated trace context inside a stream entry.
+//
+// Prefixed so trace plumbing can never collide with a future payload field,
+// and so a human reading XRANGE output can tell instantly which fields are
+// ours and which belong to OpenTelemetry.
+const traceFieldPrefix = "otel_"
 
 // ValkeyQueue is a Queue backed by a Valkey stream with one consumer group.
 type ValkeyQueue struct {
@@ -116,11 +125,21 @@ func (q *ValkeyQueue) ensureGroup(ctx context.Context) error {
 	return fmt.Errorf("create consumer group: %w", err)
 }
 
-// Enqueue appends an event to the stream.
+// Enqueue appends an event to the stream, carrying the caller's trace context.
+//
+// The trace context rides as ordinary string fields. That is the whole reason
+// an event's trace can span ingest and delivery: the consumer extracts these
+// and starts its span as a child of the producer's, rather than opening an
+// unrelated trace that nothing links back.
 func (q *ValkeyQueue) Enqueue(ctx context.Context, eventID uuid.UUID) error {
+	values := map[string]any{fieldEventID: eventID.String()}
+	for k, v := range telemetry.InjectContext(ctx) {
+		values[traceFieldPrefix+k] = v
+	}
+
 	args := &redis.XAddArgs{
 		Stream: q.stream,
-		Values: map[string]any{fieldEventID: eventID.String()},
+		Values: values,
 	}
 	if q.maxLen > 0 {
 		args.MaxLen = q.maxLen
@@ -309,6 +328,23 @@ func (q *ValkeyQueue) Close() error {
 	return q.client.Close()
 }
 
+// Len reports the total entries in the stream, which is what XLEN returns.
+//
+// Distinct from Depth: Depth is the consumer group's lag — work not yet handed
+// to anyone — while Len includes acknowledged entries still inside the MAXLEN
+// window. Depth is what tells you whether workers are keeping up; Len tells you
+// how much history the trim is holding.
+func (q *ValkeyQueue) Len(ctx context.Context) (int64, error) {
+	n, err := q.client.XLen(ctx, q.stream).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("queue length: %w", err)
+	}
+	return n, nil
+}
+
 // toClaimedMessage converts a stream entry, rejecting malformed ones.
 func toClaimedMessage(msg redis.XMessage, deliveryCount int64) (ClaimedMessage, error) {
 	raw, ok := msg.Values[fieldEventID].(string)
@@ -319,10 +355,28 @@ func toClaimedMessage(msg redis.XMessage, deliveryCount int64) (ClaimedMessage, 
 	if err != nil {
 		return ClaimedMessage{}, fmt.Errorf("entry %s has an unparseable event id %q: %w", msg.ID, raw, err)
 	}
+
+	// Strip the namespace back off so the propagator sees the keys it wrote.
+	var traceFields map[string]string
+	for k, v := range msg.Values {
+		if !strings.HasPrefix(k, traceFieldPrefix) {
+			continue
+		}
+		sv, ok := v.(string)
+		if !ok {
+			continue
+		}
+		if traceFields == nil {
+			traceFields = make(map[string]string, 2)
+		}
+		traceFields[strings.TrimPrefix(k, traceFieldPrefix)] = sv
+	}
+
 	return ClaimedMessage{
 		MessageID:     msg.ID,
 		EventID:       id,
 		DeliveryCount: deliveryCount,
+		TraceFields:   traceFields,
 	}, nil
 }
 

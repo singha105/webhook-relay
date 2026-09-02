@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -11,9 +12,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
+	"github.com/singha105/webhook-relay/internal/breaker"
 	"github.com/singha105/webhook-relay/internal/config"
 	"github.com/singha105/webhook-relay/internal/httpapi"
 	"github.com/singha105/webhook-relay/internal/store"
+	"github.com/singha105/webhook-relay/internal/telemetry"
 )
 
 func main() {
@@ -52,9 +57,71 @@ func run() error {
 	defer st.Close()
 	logger.Info("connected to postgres", slog.Int("max_conns", int(cfg.DBMaxConns)))
 
+	tracing, shutdownTracing, traceErr := telemetry.SetupTracing(ctx, telemetry.TracingConfig{
+		Enabled:        cfg.TracingEnabled,
+		Endpoint:       cfg.OTLPEndpoint,
+		ServiceName:    "webhook-relay-api",
+		ServiceVersion: cfg.ServiceVersion,
+		SampleRatio:    cfg.TraceSampleRatio,
+	}, logger)
+	if traceErr != nil {
+		return fmt.Errorf("setup tracing: %w", traceErr)
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if flushErr := shutdownTracing(flushCtx); flushErr != nil {
+			logger.Warn("could not flush traces on shutdown", slog.Any("error", flushErr))
+		}
+	}()
+
+	metrics, metricsErr := telemetry.SetupMetrics(telemetry.MetricsConfig{
+		ServiceName:    "webhook-relay-api",
+		ServiceVersion: cfg.ServiceVersion,
+	}, logger)
+	if metricsErr != nil {
+		return fmt.Errorf("setup metrics: %w", metricsErr)
+	}
+	defer func() { _ = metrics.Shutdown(context.Background()) }()
+
+	// The API has no queue handle, so it reports the backlog gauge from
+	// Postgres — which is the durable source anyway, and the one that survives
+	// Valkey being restarted.
+	metrics.SetOldestAgeSource(func(ctx context.Context) (float64, error) {
+		age, err := st.OldestBacklogAge(ctx)
+		return age.Seconds(), err
+	})
+
+	redisOpt, redisErr := redis.ParseURL(cfg.ValkeyURL)
+	if redisErr != nil {
+		return fmt.Errorf("parse valkey url: %w", redisErr)
+	}
+	redisClient := redis.NewClient(redisOpt)
+	defer func() { _ = redisClient.Close() }()
+
+	brk := breaker.New(redisClient, breaker.Config{
+		Threshold: cfg.BreakerThreshold,
+		Cooldown:  cfg.BreakerCooldown,
+		Enabled:   cfg.BreakerEnabled,
+	})
+
+	// Readiness for the API. Unlike the worker, it DOES include the backlog
+	// check: shedding ingest while the workers catch up is better than
+	// accepting events we already know we cannot deliver on time.
+	ready := httpapi.NewReadinessChecker().
+		Add("postgres", st.Ping).
+		Add("valkey", func(ctx context.Context) error { return redisClient.Ping(ctx).Err() }).
+		AddBacklogCheck(cfg.ReadinessMaxBacklogAge, st.OldestBacklogAge)
+
+	apiServer := httpapi.NewServer(st, logger, httpapi.ServerConfig{RequestTimeout: cfg.RequestTimeout}).
+		WithBreaker(brk).
+		WithMetrics(metrics).
+		WithTracer(tracing.Tracer).
+		WithReadiness(ready)
+
 	srv := &http.Server{
 		Addr:    cfg.HTTPAddr,
-		Handler: httpapi.NewServer(st, logger, httpapi.ServerConfig{RequestTimeout: cfg.RequestTimeout}).Routes(),
+		Handler: apiServer.Routes(),
 
 		// Without these a slow or malicious client can hold a connection open
 		// indefinitely and exhaust the listener.

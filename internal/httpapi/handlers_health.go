@@ -25,10 +25,13 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 
-	if err := s.store.Ping(ctx); err != nil {
+	if err := s.ready.Check(ctx); err != nil {
+		// The reason is returned because this endpoint is for operators and
+		// orchestrators, not for the public: "unavailable" alone would send
+		// someone digging through logs for what a single line could say.
 		writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{
 			"status": "unavailable",
-			"reason": "database unreachable",
+			"reason": err.Error(),
 		})
 		return
 	}

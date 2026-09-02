@@ -5,8 +5,12 @@ import (
 	"log/slog"
 	"net/http"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/singha105/webhook-relay/internal/models"
 	"github.com/singha105/webhook-relay/internal/store"
+	"github.com/singha105/webhook-relay/internal/telemetry"
 )
 
 // HeaderIdempotencyKey is the optional ingest deduplication header.
@@ -24,6 +28,14 @@ const HeaderIdempotencyKey = "Idempotency-Key"
 // latency to every valid request in order to produce a nicer error for an
 // invalid one — and it would still be racy against a concurrent delete.
 func (s *Server) ingestEvent(w http.ResponseWriter, r *http.Request) {
+	// The root span for an event's entire life. Everything downstream — the
+	// queue hop and every delivery attempt — hangs off this one, which is what
+	// makes a single trace answer "what happened to event X".
+	ctx, span := s.tracer.Start(r.Context(), "webhook.ingest",
+		trace.WithSpanKind(trace.SpanKindServer))
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	var req models.CreateEventRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -54,7 +66,13 @@ func (s *Server) ingestEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	event, created, err := s.store.CreateEvent(r.Context(), eventID, endpointID, req.EventType, req.Payload, keyPtr)
+	span.SetAttributes(
+		telemetry.AttrEndpointID(endpointID.String()),
+		telemetry.AttrEventType(req.EventType),
+		telemetry.AttrEventID(eventID.String()),
+	)
+
+	event, created, err := s.store.CreateEvent(ctx, eventID, endpointID, req.EventType, req.Payload, keyPtr)
 	if err != nil {
 		if errors.Is(err, store.ErrEndpointNotFound) {
 			// 422, not 404: the URL is correct, the body references something
@@ -67,21 +85,31 @@ func (s *Server) ingestEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log := LoggerFrom(r.Context()).With(
+	log := LoggerFrom(ctx).With(
 		slog.String("event_id", event.ID.String()),
 		slog.String("endpoint_id", event.EndpointID.String()),
 		slog.String("event_type", event.EventType),
 	)
+	if traceID := telemetry.TraceIDFrom(ctx); traceID != "" {
+		log = log.With(slog.String("trace_id", traceID))
+	}
 
 	if !created {
 		// A replayed idempotency key is a success, not a conflict. 200 rather
 		// than 202 tells the caller "this already existed" without making them
 		// parse the body to find out.
 		log.Info("event ingest deduplicated by idempotency key")
+		span.SetAttributes(attribute.Bool("webhook.deduplicated", true))
 		writeJSON(w, r, http.StatusOK, event)
 		return
 	}
 
+	// Counted only for genuinely new events. Counting replays too would make
+	// the ingest rate depend on how often clients retry, which is not what the
+	// panel is asking.
+	if s.metrics != nil {
+		s.metrics.RecordIngest(ctx, event.EventType)
+	}
 	log.Info("event accepted")
 	// 202, not 201: the event is durably recorded but nothing has been
 	// delivered. Claiming 201 Created would imply the work is done.

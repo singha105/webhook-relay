@@ -19,6 +19,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/singha105/webhook-relay/pkg/webhook"
@@ -94,6 +95,12 @@ type Sink struct {
 	secret string
 	// perEvent counts requests per event id, for FailFirstN.
 	perEvent map[string]int
+	// inFlight counts requests that have ARRIVED but not yet been responded
+	// to. Distinct from len(records), because a record is only written once
+	// the response is decided — so a test that waits on the record count is
+	// waiting for the request to finish, not to start. Shutdown tests need
+	// the opposite signal.
+	inFlight atomic.Int64
 }
 
 // New returns a sink that answers 200 and records everything.
@@ -147,6 +154,13 @@ func (s *Sink) Reset() {
 	s.records = nil
 	s.perEvent = make(map[string]int)
 }
+
+// InFlight returns how many requests have arrived and are still being handled.
+//
+// This is the signal a shutdown test needs: "a delivery is genuinely in
+// progress right now", which the record count cannot express because records
+// are written only once a response has been decided.
+func (s *Sink) InFlight() int64 { return s.inFlight.Load() }
 
 // Count returns how many deliveries have been received.
 func (s *Sink) Count() int {
@@ -213,6 +227,9 @@ func (s *Sink) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sink accepts POST", http.StatusMethodNotAllowed)
 		return
 	}
+
+	s.inFlight.Add(1)
+	defer s.inFlight.Add(-1)
 
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	defer func() { _ = r.Body.Close() }()
@@ -324,6 +341,7 @@ func (s *Sink) handleStats(w http.ResponseWriter, _ *http.Request) {
 		byEvent[r.EventID]++
 	}
 	writeJSON(w, map[string]any{
+		"in_flight":        s.InFlight(),
 		"total":            len(records),
 		"distinct_events":  len(byEvent),
 		"per_event":        byEvent,

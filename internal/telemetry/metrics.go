@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/otlptranslator"
 	"go.opentelemetry.io/otel/attribute"
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric"
@@ -81,11 +82,12 @@ func SetupMetrics(cfg MetricsConfig, logger *slog.Logger) (*Metrics, error) {
 
 	exporter, err := otelprom.New(
 		otelprom.WithRegisterer(registry),
-		// Without this the exporter appends its own unit suffixes and a
-		// _total on top of names we have already chosen, producing
-		// webhook_events_ingested_total_total.
-		otelprom.WithoutCounterSuffixes(),
-		otelprom.WithoutUnits(),
+		// NoTranslation, because the instrument names in this file are already
+		// the final Prometheus names. The default strategy appends unit
+		// suffixes and a _total to counters, which on top of names that
+		// already carry them produces webhook_events_ingested_total_total —
+		// silently breaking every dashboard query and the SLO PromQL.
+		otelprom.WithTranslationStrategy(otlptranslator.NoTranslation),
 		// The target_info metric duplicates resource attributes onto a series
 		// nothing queries here.
 		otelprom.WithoutTargetInfo(),
@@ -206,22 +208,22 @@ func (m *Metrics) registerObservables(meter metric.Meter) error {
 		// gauge would take every other metric with it, blinding the dashboard
 		// at precisely the moment something is wrong.
 		if depthFn != nil {
-			if v, err := depthFn(ctx); err != nil {
-				m.logger.Warn("queue depth gauge unavailable", slog.Any("error", err))
+			if v, depthErr := depthFn(ctx); depthErr != nil {
+				m.logger.Warn("queue depth gauge unavailable", slog.Any("error", depthErr))
 			} else {
 				o.ObserveInt64(queueDepth, v)
 			}
 		}
 		if ageFn != nil {
-			if v, err := ageFn(ctx); err != nil {
-				m.logger.Warn("oldest message age gauge unavailable", slog.Any("error", err))
+			if v, ageErr := ageFn(ctx); ageErr != nil {
+				m.logger.Warn("oldest message age gauge unavailable", slog.Any("error", ageErr))
 			} else {
 				o.ObserveFloat64(oldestAge, v)
 			}
 		}
 		if brkFn != nil {
-			if states, err := brkFn(ctx); err != nil {
-				m.logger.Warn("breaker state gauge unavailable", slog.Any("error", err))
+			if states, brkErr := brkFn(ctx); brkErr != nil {
+				m.logger.Warn("breaker state gauge unavailable", slog.Any("error", brkErr))
 			} else {
 				for endpointID, state := range states {
 					o.ObserveFloat64(breakerState, state,

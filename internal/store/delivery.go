@@ -333,3 +333,83 @@ func (s *Store) NextAttemptNumber(ctx context.Context, eventID uuid.UUID) (int, 
 	}
 	return n, nil
 }
+
+// RescheduleWithoutAttempt defers an event without consuming an attempt.
+//
+// This is what a rate limit or an open circuit breaker produces. Neither is a
+// failed delivery: the receiver never saw the request, so there is nothing to
+// record in the attempt history and nothing that should count against the
+// event's budget. Burning an attempt here would mean a slow consumer — a
+// customer doing exactly what their rate limit says they may — eventually gets
+// their events dead-lettered for being slow, which is absurd.
+//
+// The status goes back to 'failed' rather than 'pending' only because that is
+// the state the relay's claim query looks for alongside 'pending'; both are
+// treated identically. attempt_count is left untouched.
+func (s *Store) RescheduleWithoutAttempt(ctx context.Context, eventID uuid.UUID, nextRetryAt time.Time) error {
+	const q = `
+		UPDATE events
+		SET status = 'failed', next_retry_at = $2
+		WHERE id = $1 AND status NOT IN ('delivered', 'dlq')`
+
+	if _, err := s.pool.Exec(ctx, q, eventID, nextRetryAt); err != nil {
+		return fmt.Errorf("reschedule event %s: %w", eventID, err)
+	}
+	return nil
+}
+
+// OldestBacklogAge returns how long the oldest undelivered event has been
+// waiting since it was ingested.
+//
+// This is the SLO metric, and it is measured from created_at rather than from
+// when the event entered the queue, because that is what a customer
+// experiences: the clock starts when they handed us the event, not when we got
+// around to scheduling it.
+//
+// It reads from Postgres rather than from the stream deliberately. The stream
+// only knows about work it currently holds, so a Valkey restart would reset
+// this gauge to zero and make a large backlog look healthy — the exact moment
+// the number matters most. Postgres holds the durable truth.
+//
+// Returns 0 when nothing is outstanding.
+func (s *Store) OldestBacklogAge(ctx context.Context) (time.Duration, error) {
+	const q = `
+		SELECT COALESCE(EXTRACT(EPOCH FROM (now() - MIN(created_at))), 0)
+		FROM events
+		WHERE status IN ('pending', 'failed', 'delivering')`
+
+	var seconds float64
+	if err := s.pool.QueryRow(ctx, q).Scan(&seconds); err != nil {
+		return 0, fmt.Errorf("oldest backlog age: %w", err)
+	}
+	if seconds < 0 {
+		seconds = 0
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
+}
+
+// ActiveEndpointIDs lists endpoints for the per-endpoint breaker gauge.
+//
+// Bounded by limit because the gauge produces one series per endpoint. That is
+// acceptable for the tens of endpoints this service is built for, and would be
+// a cardinality problem at thousands — which is why the bound exists and is
+// documented rather than left implicit.
+func (s *Store) ActiveEndpointIDs(ctx context.Context, limit int) ([]uuid.UUID, error) {
+	const q = `SELECT id FROM endpoints WHERE is_active ORDER BY created_at LIMIT $1`
+
+	rows, err := s.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list active endpoint ids: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]uuid.UUID, 0, limit)
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan endpoint id: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
