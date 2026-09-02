@@ -7,8 +7,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/singha105/webhook-relay/internal/queue"
+	"github.com/singha105/webhook-relay/internal/telemetry"
 	"github.com/singha105/webhook-relay/test"
 )
 
@@ -269,4 +274,160 @@ func TestPing(t *testing.T) {
 	if err := test.NewQueue(t).Ping(context.Background()); err != nil {
 		t.Errorf("Ping() = %v", err)
 	}
+}
+
+// The queue is where trace context has to survive, so assert it here rather
+// than only in the telemetry package's unit tests: this exercises the real
+// round trip through Valkey, including the field namespacing.
+func TestTraceContextSurvivesTheStream(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	q := test.NewQueue(t)
+
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{}, propagation.Baggage{},
+	))
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()))
+	defer func() { _ = tp.Shutdown(ctx) }()
+	tracer := tp.Tracer("queue-test")
+
+	producerCtx, span := tracer.Start(ctx, "ingest")
+	wantTrace := span.SpanContext().TraceID()
+	wantSpan := span.SpanContext().SpanID()
+
+	id := uuid.New()
+	if err := q.Enqueue(producerCtx, id); err != nil {
+		t.Fatalf("Enqueue() = %v", err)
+	}
+	span.End()
+
+	msgs, err := q.Claim(ctx, "consumer", 10)
+	if err != nil {
+		t.Fatalf("Claim() = %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("claimed %d messages, want 1", len(msgs))
+	}
+	msg := msgs[0]
+	defer func() { _ = q.Ack(ctx, msg.MessageID) }()
+
+	if len(msg.TraceFields) == 0 {
+		t.Fatal("the claimed message carries no trace fields; the trace would break at the queue")
+	}
+	if _, ok := msg.TraceFields["traceparent"]; !ok {
+		t.Errorf("trace fields = %v, want a traceparent key with the prefix stripped", msg.TraceFields)
+	}
+
+	// The consumer side: a span started here must join the producer's trace.
+	consumerCtx := telemetry.ExtractContext(ctx, msg.TraceFields)
+	_, deliverSpan := tracer.Start(consumerCtx, "deliver")
+	defer deliverSpan.End()
+
+	if got := deliverSpan.SpanContext().TraceID(); got != wantTrace {
+		t.Errorf("delivery is in trace %s, want %s — the trace broke crossing Valkey", got, wantTrace)
+	}
+	parent := trace.SpanContextFromContext(consumerCtx)
+	if parent.SpanID() != wantSpan {
+		t.Errorf("parent span = %s, want the ingest span %s", parent.SpanID(), wantSpan)
+	}
+}
+
+func TestLenCountsEveryEntry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	q := test.NewQueue(t)
+
+	if n, err := q.Len(ctx); err != nil || n != 0 {
+		t.Fatalf("Len() on an empty stream = %d, %v", n, err)
+	}
+	for i := 0; i < 4; i++ {
+		if err := q.Enqueue(ctx, uuid.New()); err != nil {
+			t.Fatalf("Enqueue() = %v", err)
+		}
+	}
+	msgs, err := q.Claim(ctx, "c", 4)
+	if err != nil {
+		t.Fatalf("Claim() = %v", err)
+	}
+	for _, m := range msgs {
+		if err := q.Ack(ctx, m.MessageID); err != nil {
+			t.Fatalf("Ack() = %v", err)
+		}
+	}
+
+	// Depth drains as entries are consumed; Len does not, because XACK removes
+	// an entry from the pending list but not from the stream.
+	depth, err := q.Depth(ctx)
+	if err != nil {
+		t.Fatalf("Depth() = %v", err)
+	}
+	length, err := q.Len(ctx)
+	if err != nil {
+		t.Fatalf("Len() = %v", err)
+	}
+	if depth != 0 {
+		t.Errorf("Depth() = %d after acking everything, want 0", depth)
+	}
+	if length != 4 {
+		t.Errorf("Len() = %d, want 4 — acked entries remain in the stream until trimmed", length)
+	}
+}
+
+// A Valkey restart without persistence, a flushed database, or an operator
+// running FLUSHALL all destroy the stream and its consumer group. Before this
+// was handled, every worker wedged permanently on NOGROUP: delivery stopped
+// silently while the relay kept enqueueing, because XADD recreates the stream
+// but not the group.
+//
+// Day 5 deletes the Valkey pod on purpose, so this path is load-bearing.
+func TestQueueRecoversFromALostConsumerGroup(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	q := test.NewQueue(t)
+	client := test.NewRedisClient(t)
+
+	// Normal operation first, so the group definitely exists.
+	if err := q.Enqueue(ctx, uuid.New()); err != nil {
+		t.Fatalf("Enqueue() = %v", err)
+	}
+	msgs, err := q.Claim(ctx, "c1", 10)
+	if err != nil {
+		t.Fatalf("Claim() = %v", err)
+	}
+	for _, m := range msgs {
+		_ = q.Ack(ctx, m.MessageID)
+	}
+
+	// Destroy the stream, exactly as a wiped Valkey would.
+	if err := client.Del(ctx, queue.StreamKeyFor(q)).Err(); err != nil {
+		t.Fatalf("deleting the stream: %v", err)
+	}
+
+	// The relay carries on enqueueing; XADD recreates the stream but not the
+	// consumer group.
+	want := uuid.New()
+	if err := q.Enqueue(ctx, want); err != nil {
+		t.Fatalf("Enqueue() after the flush = %v", err)
+	}
+
+	// The worker must recover on its own rather than looping on NOGROUP.
+	var got []queue.ClaimedMessage
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err = q.Claim(ctx, "c1", 10)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, queue.ErrEmpty) {
+			t.Fatalf("Claim() after the flush = %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(got) == 0 {
+		t.Fatal("the worker never recovered after the consumer group was destroyed")
+	}
+	if got[0].EventID != want {
+		t.Errorf("recovered event %s, want %s", got[0].EventID, want)
+	}
+	_ = q.Ack(ctx, got[0].MessageID)
 }

@@ -10,8 +10,10 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/singha105/webhook-relay/internal/breaker"
 	"github.com/singha105/webhook-relay/internal/delivery"
 	"github.com/singha105/webhook-relay/internal/queue"
+	"github.com/singha105/webhook-relay/internal/ratelimit"
 	"github.com/singha105/webhook-relay/internal/relay"
 	"github.com/singha105/webhook-relay/internal/store"
 	"github.com/singha105/webhook-relay/internal/worker"
@@ -34,6 +36,11 @@ type Pipeline struct {
 	// Backoff is the policy the pool was built with, so tests can assert
 	// against the same ceilings the worker uses.
 	Backoff delivery.Backoff
+	// Pool is exposed so shutdown tests can drive Drain directly.
+	Pool *worker.Pool
+	// Breaker and Limiter are exposed so tests can inspect and reset them.
+	Breaker *breaker.Breaker
+	Limiter *ratelimit.Limiter
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -62,6 +69,17 @@ type PipelineConfig struct {
 	// Logs, when true, sends worker logs to the test log instead of discarding
 	// them. Useful when a test is failing and you need to see why.
 	Logs bool
+
+	// RateLimitEnabled turns the token bucket on. Off by default so tests that
+	// are not about rate limiting are not throttled by it.
+	RateLimitEnabled bool
+	// BreakerEnabled turns the circuit breaker on, likewise off by default.
+	BreakerEnabled bool
+	// BreakerThreshold and BreakerCooldown configure the breaker when enabled.
+	BreakerThreshold int
+	BreakerCooldown  time.Duration
+	// DrainTimeout bounds the shutdown drain. Default 5s for tests.
+	DrainTimeout time.Duration
 }
 
 func (c PipelineConfig) withDefaults() PipelineConfig {
@@ -86,6 +104,15 @@ func (c PipelineConfig) withDefaults() PipelineConfig {
 	if c.DedupEnabled == nil {
 		enabled := true
 		c.DedupEnabled = &enabled
+	}
+	if c.BreakerThreshold <= 0 {
+		c.BreakerThreshold = 5
+	}
+	if c.BreakerCooldown <= 0 {
+		c.BreakerCooldown = 300 * time.Millisecond
+	}
+	if c.DrainTimeout <= 0 {
+		c.DrainTimeout = 5 * time.Second
 	}
 	return c
 }
@@ -131,16 +158,31 @@ func NewPipeline(t *testing.T, cfg PipelineConfig) *Pipeline {
 		SweepInterval: time.Second,
 	})
 
-	pool := worker.New(st, q, client, deduper,
-		logger.With(slog.String("component", "worker")),
-		"test", worker.Config{
-			Concurrency:     cfg.Concurrency,
-			PollInterval:    20 * time.Millisecond,
-			BatchSize:       2,
-			StaleTimeout:    cfg.StaleTimeout,
-			ReclaimInterval: 500 * time.Millisecond,
-			Backoff:         backoff,
-		})
+	limiter := ratelimit.New(redisClient, 1.0, cfg.RateLimitEnabled)
+	brk := breaker.New(redisClient, breaker.Config{
+		Threshold: cfg.BreakerThreshold,
+		Cooldown:  cfg.BreakerCooldown,
+		Enabled:   cfg.BreakerEnabled,
+	})
+
+	pool := worker.New(worker.Deps{
+		Store:   st,
+		Queue:   q,
+		Client:  client,
+		Deduper: deduper,
+		Limiter: limiter,
+		Breaker: brk,
+		Logger:  logger.With(slog.String("component", "worker")),
+		Name:    "test",
+	}, worker.Config{
+		Concurrency:     cfg.Concurrency,
+		PollInterval:    20 * time.Millisecond,
+		BatchSize:       2,
+		StaleTimeout:    cfg.StaleTimeout,
+		ReclaimInterval: 500 * time.Millisecond,
+		Backoff:         backoff,
+		DrainTimeout:    cfg.DrainTimeout,
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{}, 2)
@@ -150,7 +192,8 @@ func NewPipeline(t *testing.T, cfg PipelineConfig) *Pipeline {
 
 	p := &Pipeline{
 		Store: st, Queue: q, Sink: s, SinkURL: srv.URL + "/hook",
-		Backoff: backoff, cancel: cancel, done: done,
+		Backoff: backoff, Pool: pool, Breaker: brk, Limiter: limiter,
+		cancel: cancel, done: done,
 	}
 	t.Cleanup(p.Stop)
 	return p

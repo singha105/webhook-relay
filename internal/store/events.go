@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/singha105/webhook-relay/internal/models"
+	"github.com/singha105/webhook-relay/internal/telemetry"
 )
 
 // ErrEndpointNotFound is returned by CreateEvent when the referenced endpoint
@@ -58,13 +59,24 @@ func scanEvent(row pgx.Row) (*models.Event, error) {
 // system column.
 func (s *Store) CreateEvent(ctx context.Context, id, endpointID uuid.UUID, eventType string, payload json.RawMessage, idempotencyKey *string) (event *models.Event, created bool, err error) {
 	const q = `
-		INSERT INTO events (id, endpoint_id, event_type, payload, idempotency_key)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO events (id, endpoint_id, event_type, payload, idempotency_key, trace_context)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (endpoint_id, idempotency_key) WHERE idempotency_key IS NOT NULL
 		DO UPDATE SET idempotency_key = events.idempotency_key
 		RETURNING ` + eventColumns
 
-	e, err := scanEvent(s.pool.QueryRow(ctx, q, id, endpointID, eventType, []byte(payload), idempotencyKey))
+	// The caller's trace context is persisted with the event. The relay that
+	// eventually enqueues this row runs later, in another goroutine and usually
+	// another process, so there is no in-memory context for it to inherit —
+	// this column is the only thing that can carry the trace across the outbox.
+	var traceJSON []byte
+	if carrier := telemetry.InjectContext(ctx); len(carrier) > 0 {
+		if encoded, mErr := json.Marshal(carrier); mErr == nil {
+			traceJSON = encoded
+		}
+	}
+
+	e, err := scanEvent(s.pool.QueryRow(ctx, q, id, endpointID, eventType, []byte(payload), idempotencyKey, traceJSON))
 	if err != nil {
 		if isForeignKeyViolation(err) {
 			return nil, false, ErrEndpointNotFound

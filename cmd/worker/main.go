@@ -21,15 +21,19 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/singha105/webhook-relay/internal/breaker"
 	"github.com/singha105/webhook-relay/internal/config"
 	"github.com/singha105/webhook-relay/internal/delivery"
 	"github.com/singha105/webhook-relay/internal/httpapi"
 	"github.com/singha105/webhook-relay/internal/queue"
+	"github.com/singha105/webhook-relay/internal/ratelimit"
 	"github.com/singha105/webhook-relay/internal/relay"
 	"github.com/singha105/webhook-relay/internal/store"
+	"github.com/singha105/webhook-relay/internal/telemetry"
 	"github.com/singha105/webhook-relay/internal/worker"
 )
 
@@ -55,6 +59,37 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	tracing, shutdownTracing, traceErr := telemetry.SetupTracing(ctx, telemetry.TracingConfig{
+		Enabled:        cfg.TracingEnabled,
+		Endpoint:       cfg.OTLPEndpoint,
+		ServiceName:    "webhook-relay-worker",
+		ServiceVersion: cfg.ServiceVersion,
+		SampleRatio:    cfg.TraceSampleRatio,
+	}, logger)
+	if traceErr != nil {
+		// Not fatal in spirit, but a misconfigured endpoint should be loud at
+		// boot rather than silently dropping every trace.
+		return fmt.Errorf("setup tracing: %w", traceErr)
+	}
+	defer func() {
+		// A fresh context: the signal context is already cancelled by now, and
+		// passing it would discard the spans we are trying to flush.
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if flushErr := shutdownTracing(flushCtx); flushErr != nil {
+			logger.Warn("could not flush traces on shutdown", slog.Any("error", flushErr))
+		}
+	}()
+
+	metrics, metricsErr := telemetry.SetupMetrics(telemetry.MetricsConfig{
+		ServiceName:    "webhook-relay-worker",
+		ServiceVersion: cfg.ServiceVersion,
+	}, logger)
+	if metricsErr != nil {
+		return fmt.Errorf("setup metrics: %w", metricsErr)
+	}
+	defer func() { _ = metrics.Shutdown(context.Background()) }()
 
 	st, err := store.New(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBConnectTimeout)
 	if err != nil {
@@ -85,6 +120,37 @@ func run() error {
 	defer func() { _ = redisClient.Close() }()
 
 	deduper := delivery.NewDeduper(redisClient, cfg.DeliveryDedupTTL, cfg.DeliveryDedupEnabled)
+	limiter := ratelimit.New(redisClient, cfg.RateLimitBurstFactor, cfg.RateLimitEnabled)
+	brk := breaker.New(redisClient, breaker.Config{
+		Threshold: cfg.BreakerThreshold,
+		Cooldown:  cfg.BreakerCooldown,
+		Enabled:   cfg.BreakerEnabled,
+	})
+
+	// Gauges are read at scrape time rather than sampled on a timer, so the
+	// dashboard shows the queue as it is now, not as it was a minute ago.
+	metrics.SetQueueDepthSource(func(ctx context.Context) (int64, error) {
+		return q.Depth(ctx)
+	})
+	metrics.SetOldestAgeSource(func(ctx context.Context) (float64, error) {
+		age, err := st.OldestBacklogAge(ctx)
+		return age.Seconds(), err
+	})
+	metrics.SetBreakerStateSource(func(ctx context.Context) (map[string]float64, error) {
+		ids, err := st.ActiveEndpointIDs(ctx, maxBreakerSeries)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string]float64, len(ids))
+		for _, id := range ids {
+			state, err := brk.Current(ctx, id)
+			if err != nil {
+				continue
+			}
+			out[id.String()] = state.Numeric()
+		}
+		return out, nil
+	})
 
 	client := delivery.NewClient(delivery.ClientConfig{
 		Timeout: cfg.DeliveryTimeout,
@@ -107,14 +173,48 @@ func run() error {
 		Lease:        cfg.DeliveryLease,
 	})
 
-	pool := worker.New(st, q, client, deduper,
-		logger.With(slog.String("component", "worker")),
-		hostname,
-		worker.Config{
-			Concurrency:  cfg.WorkerConcurrency,
-			StaleTimeout: cfg.StaleClaimTimeout,
-			Backoff:      delivery.NewBackoff(cfg.RetryBaseDelay, cfg.RetryMaxDelay, cfg.MaxAttempts),
-		})
+	pool := worker.New(worker.Deps{
+		Store:   st,
+		Queue:   q,
+		Client:  client,
+		Deduper: deduper,
+		Limiter: limiter,
+		Breaker: brk,
+		Metrics: metrics,
+		Tracer:  tracing.Tracer,
+		Logger:  logger.With(slog.String("component", "worker")),
+		Name:    hostname,
+	}, worker.Config{
+		Concurrency:  cfg.WorkerConcurrency,
+		StaleTimeout: cfg.StaleClaimTimeout,
+		Backoff:      delivery.NewBackoff(cfg.RetryBaseDelay, cfg.RetryMaxDelay, cfg.MaxAttempts),
+		DrainTimeout: cfg.DrainTimeout,
+	})
+
+	// Readiness for the worker: it needs both dependencies to do any work at
+	// all. The backlog check is deliberately NOT applied here — a worker with a
+	// deep backlog is the one thing working on it, and pulling it out of the
+	// Service would only slow recovery.
+	ready := httpapi.NewReadinessChecker().
+		Add("postgres", st.Ping).
+		Add("valkey", q.Ping)
+
+	ops := httpapi.NewOpsServer(httpapi.OpsConfig{
+		Addr:    cfg.MetricsAddr,
+		Metrics: metrics,
+		Ready:   ready.Check,
+		Logger:  logger,
+	})
+	opsErr := make(chan error, 1)
+	ops.Start(opsErr)
+	logger.Info("operational listener started",
+		slog.String("addr", cfg.MetricsAddr),
+		slog.String("endpoints", "/healthz /readyz /metrics"))
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = ops.Shutdown(shutdownCtx)
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -131,14 +231,34 @@ func run() error {
 		}
 	}()
 
-	<-ctx.Done()
-	logger.Info("shutdown signal received; finishing in-flight deliveries")
+	select {
+	case err := <-opsErr:
+		return fmt.Errorf("operational listener failed: %w", err)
+	case <-ctx.Done():
+	}
 
-	// No timeout on this wait. A delivery already in flight is bounded by the
-	// delivery timeout, and cutting it short would leave an unacked entry to be
-	// reclaimed and delivered a second time — turning a clean shutdown into a
-	// duplicate. Kubernetes' terminationGracePeriodSeconds is the real bound.
+	logger.Info("shutdown signal received; draining in-flight deliveries",
+		slog.Duration("budget", cfg.DrainTimeout))
+
+	// Drain BEFORE waiting on the goroutines. Drain stops them claiming new
+	// work and waits for the deliveries they already hold, so by the time the
+	// context-driven loops exit there is nothing half-finished. Doing it the
+	// other way round would race: the loops would exit on ctx.Done() while a
+	// delivery was still in flight, leaving it unacked and guaranteeing a
+	// duplicate on the next reclaim.
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.DrainTimeout+5*time.Second)
+	defer cancelDrain()
+	if err := pool.Drain(drainCtx); err != nil {
+		logger.Warn("drain did not complete cleanly", slog.Any("error", err))
+	}
+
 	wg.Wait()
 	logger.Info("worker shutdown complete")
 	return nil
 }
+
+// maxBreakerSeries bounds the per-endpoint breaker gauge. One series per
+// endpoint is fine for the tens this service targets and would be a
+// cardinality problem at thousands, so the bound is explicit rather than
+// implied.
+const maxBreakerSeries = 500

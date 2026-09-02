@@ -72,6 +72,40 @@ type Config struct {
 	DeliveryDedupEnabled bool
 	// DeliveryDedupTTL is how long a dispatch marker lives.
 	DeliveryDedupTTL time.Duration
+
+	// --- resilience (day 3) ---
+
+	// RateLimitEnabled turns the per-endpoint token bucket on.
+	RateLimitEnabled bool
+	// RateLimitBurstFactor multiplies the per-second rate to get capacity.
+	RateLimitBurstFactor float64
+	// BreakerEnabled turns the per-endpoint circuit breaker on.
+	BreakerEnabled bool
+	// BreakerThreshold is how many consecutive failures open a breaker.
+	BreakerThreshold int
+	// BreakerCooldown is how long a breaker stays open before a probe.
+	BreakerCooldown time.Duration
+
+	// --- observability (day 3) ---
+
+	// MetricsAddr is the listen address for the worker's operational surface.
+	MetricsAddr string
+	// TracingEnabled turns OTLP trace export on.
+	TracingEnabled bool
+	// OTLPEndpoint is the collector's gRPC address.
+	OTLPEndpoint string
+	// TraceSampleRatio is head sampling, 0..1.
+	TraceSampleRatio float64
+	// ServiceVersion is stamped on spans and metrics.
+	ServiceVersion string
+
+	// --- lifecycle (day 3) ---
+
+	// DrainTimeout bounds how long shutdown waits for in-flight deliveries.
+	DrainTimeout time.Duration
+	// ReadinessMaxBacklogAge fails readiness when the oldest undelivered event
+	// is older than this. Zero disables the check.
+	ReadinessMaxBacklogAge time.Duration
 }
 
 // Defaults. Chosen to make `make up` work with no environment at all, which is
@@ -100,6 +134,19 @@ const (
 	defaultRelayBatchSize    = 100
 	defaultDeliveryLease     = 5 * time.Minute
 	defaultDedupTTL          = 15 * time.Minute
+
+	defaultRateLimitBurstFactor = 1.0
+	defaultBreakerThreshold     = 10
+	defaultBreakerCooldown      = 5 * time.Minute
+	defaultMetricsAddr          = ":9100"
+	defaultOTLPEndpoint         = "otel-collector:4317"
+	defaultTraceSampleRatio     = 1.0
+	defaultServiceVersion       = "dev"
+	defaultDrainTimeout         = 30 * time.Second
+	// Two minutes is deliberately generous: the check exists to shed load
+	// during a genuine backlog, not to flap a replica out of its Service
+	// because a retry is legitimately waiting out its backoff.
+	defaultReadinessMaxBacklogAge = 2 * time.Minute
 
 	// maxDBConns caps the pool. Postgres allocates memory per backend, so an
 	// unbounded pool exhausts the server rather than queueing at the client.
@@ -148,6 +195,7 @@ func Load() (*Config, error) {
 		max  int
 	}{
 		{"WORKER_CONCURRENCY", defaultWorkerConcurrency, &cfg.WorkerConcurrency, 1, 1000},
+		{"BREAKER_THRESHOLD", defaultBreakerThreshold, &cfg.BreakerThreshold, 1, 10000},
 		{"MAX_ATTEMPTS", defaultMaxAttempts, &cfg.MaxAttempts, 1, 100},
 		{"RELAY_BATCH_SIZE", defaultRelayBatchSize, &cfg.RelayBatchSize, 1, 10000},
 	} {
@@ -163,11 +211,49 @@ func Load() (*Config, error) {
 		*n.dst = v
 	}
 
-	dedup, dedupErr := envBool("DELIVERY_DEDUP_ENABLED", true)
-	if dedupErr != nil {
-		problems = append(problems, dedupErr.Error())
+	for _, b := range []struct {
+		name string
+		def  bool
+		dst  *bool
+	}{
+		{"DELIVERY_DEDUP_ENABLED", true, &cfg.DeliveryDedupEnabled},
+		{"RATE_LIMIT_ENABLED", true, &cfg.RateLimitEnabled},
+		{"BREAKER_ENABLED", true, &cfg.BreakerEnabled},
+		{"TRACING_ENABLED", true, &cfg.TracingEnabled},
+	} {
+		v, err := envBool(b.name, b.def)
+		if err != nil {
+			problems = append(problems, err.Error())
+			continue
+		}
+		*b.dst = v
 	}
-	cfg.DeliveryDedupEnabled = dedup
+
+	cfg.MetricsAddr = envString("METRICS_ADDR", defaultMetricsAddr)
+	cfg.OTLPEndpoint = envString("OTLP_ENDPOINT", defaultOTLPEndpoint)
+	cfg.ServiceVersion = envString("SERVICE_VERSION", defaultServiceVersion)
+
+	for _, f := range []struct {
+		name string
+		def  float64
+		dst  *float64
+		min  float64
+		max  float64
+	}{
+		{"RATE_LIMIT_BURST_FACTOR", defaultRateLimitBurstFactor, &cfg.RateLimitBurstFactor, 0.1, 100},
+		{"TRACE_SAMPLE_RATIO", defaultTraceSampleRatio, &cfg.TraceSampleRatio, 0, 1},
+	} {
+		v, err := envFloat(f.name, f.def)
+		if err != nil {
+			problems = append(problems, err.Error())
+			continue
+		}
+		if v < f.min || v > f.max {
+			problems = append(problems, fmt.Sprintf("%s: must be between %g and %g", f.name, f.min, f.max))
+			continue
+		}
+		*f.dst = v
+	}
 
 	for _, d := range []struct {
 		name string
@@ -184,6 +270,8 @@ func Load() (*Config, error) {
 		{"RELAY_POLL_INTERVAL", defaultRelayPollInterval, &cfg.RelayPollInterval},
 		{"DELIVERY_LEASE", defaultDeliveryLease, &cfg.DeliveryLease},
 		{"DELIVERY_DEDUP_TTL", defaultDedupTTL, &cfg.DeliveryDedupTTL},
+		{"BREAKER_COOLDOWN", defaultBreakerCooldown, &cfg.BreakerCooldown},
+		{"DRAIN_TIMEOUT", defaultDrainTimeout, &cfg.DrainTimeout},
 	} {
 		v, err := envDuration(d.name, d.def)
 		if err != nil {
@@ -202,6 +290,25 @@ func Load() (*Config, error) {
 	}
 	if strings.TrimSpace(cfg.ValkeyURL) == "" {
 		problems = append(problems, "VALKEY_URL: must not be empty")
+	}
+
+	// Zero is meaningful here (disables the check), so it is parsed separately
+	// from the durations that must be positive.
+	backlogAge, backlogErr := envDuration("READINESS_MAX_BACKLOG_AGE", defaultReadinessMaxBacklogAge)
+	if backlogErr != nil {
+		problems = append(problems, backlogErr.Error())
+	} else if backlogAge < 0 {
+		problems = append(problems, "READINESS_MAX_BACKLOG_AGE: must not be negative")
+	} else {
+		cfg.ReadinessMaxBacklogAge = backlogAge
+	}
+
+	// A drain shorter than one delivery would abandon healthy in-flight work on
+	// every rolling restart, guaranteeing duplicates each deploy.
+	if cfg.DrainTimeout > 0 && cfg.DeliveryTimeout > 0 && cfg.DrainTimeout < cfg.DeliveryTimeout {
+		problems = append(problems, fmt.Sprintf(
+			"DRAIN_TIMEOUT (%s) must be at least DELIVERY_TIMEOUT (%s), or in-flight deliveries are abandoned on every restart",
+			cfg.DrainTimeout, cfg.DeliveryTimeout))
 	}
 
 	// A stale-claim timeout at or below the delivery timeout would let a
@@ -295,7 +402,33 @@ func (c *Config) Redacted() map[string]any {
 		"delivery_lease":         c.DeliveryLease.String(),
 		"delivery_dedup_enabled": c.DeliveryDedupEnabled,
 		"delivery_dedup_ttl":     c.DeliveryDedupTTL.String(),
+
+		"rate_limit_enabled":        c.RateLimitEnabled,
+		"rate_limit_burst_factor":   c.RateLimitBurstFactor,
+		"breaker_enabled":           c.BreakerEnabled,
+		"breaker_threshold":         c.BreakerThreshold,
+		"breaker_cooldown":          c.BreakerCooldown.String(),
+		"metrics_addr":              c.MetricsAddr,
+		"tracing_enabled":           c.TracingEnabled,
+		"otlp_endpoint":             c.OTLPEndpoint,
+		"trace_sample_ratio":        c.TraceSampleRatio,
+		"service_version":           c.ServiceVersion,
+		"drain_timeout":             c.DrainTimeout.String(),
+		"readiness_max_backlog_age": c.ReadinessMaxBacklogAge.String(),
 	}
+}
+
+// envFloat parses a floating-point environment variable.
+func envFloat(key string, def float64) (float64, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return def, nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q is not a number", key, raw)
+	}
+	return v, nil
 }
 
 // envBool parses a boolean environment variable.

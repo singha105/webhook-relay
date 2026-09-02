@@ -7,9 +7,13 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/singha105/webhook-relay/internal/breaker"
 	"github.com/singha105/webhook-relay/internal/queue"
 	"github.com/singha105/webhook-relay/internal/store"
+	"github.com/singha105/webhook-relay/internal/telemetry"
 )
 
 // maxRequestBodyBytes caps any request body at 1 MiB. The largest legitimate
@@ -30,6 +34,17 @@ type Server struct {
 	// absent — which is the API's default deployment — the relay picks the
 	// event up on its next tick, so replay still works, just a beat later.
 	queue queue.Queue
+
+	// breaker is optional. When present, GET /v1/endpoints/{id} reports the
+	// endpoint's live circuit-breaker state.
+	breaker *breaker.Breaker
+	// metrics is optional; nil simply records nothing.
+	metrics *telemetry.Metrics
+	// tracer is never nil — a no-op provider is installed when tracing is off,
+	// so call sites need no conditionals.
+	tracer trace.Tracer
+	// ready backs /readyz.
+	ready *ReadinessChecker
 }
 
 // ServerConfig is the subset of configuration the HTTP layer needs.
@@ -39,7 +54,41 @@ type ServerConfig struct {
 
 // NewServer builds a Server.
 func NewServer(st *store.Store, logger *slog.Logger, cfg ServerConfig) *Server {
-	return &Server{store: st, logger: logger, cfg: cfg}
+	return &Server{
+		store:  st,
+		logger: logger,
+		cfg:    cfg,
+		tracer: noop.NewTracerProvider().Tracer(""),
+		ready:  NewReadinessChecker().Add("postgres", st.Ping),
+	}
+}
+
+// WithBreaker attaches the circuit breaker so endpoint responses can report it.
+func (s *Server) WithBreaker(b *breaker.Breaker) *Server {
+	s.breaker = b
+	return s
+}
+
+// WithMetrics attaches metrics and serves them at /metrics.
+func (s *Server) WithMetrics(m *telemetry.Metrics) *Server {
+	s.metrics = m
+	return s
+}
+
+// WithTracer attaches a tracer.
+func (s *Server) WithTracer(t trace.Tracer) *Server {
+	if t != nil {
+		s.tracer = t
+	}
+	return s
+}
+
+// WithReadiness replaces the readiness checker.
+func (s *Server) WithReadiness(r *ReadinessChecker) *Server {
+	if r != nil {
+		s.ready = r
+	}
+	return s
 }
 
 // WithQueue attaches a queue so replays are enqueued immediately.
@@ -79,6 +128,9 @@ func (s *Server) Routes() http.Handler {
 	// and must not be versioned alongside it.
 	r.Get("/healthz", s.healthz)
 	r.Get("/readyz", s.readyz)
+	if s.metrics != nil {
+		r.Handle("/metrics", s.metrics.Handler())
+	}
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Route("/endpoints", func(r chi.Router) {

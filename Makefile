@@ -20,8 +20,12 @@ VALKEY_PORT   ?= $(shell [ -f .env ] && grep -E '^VALKEY_PORT=' .env | cut -d= -
 VALKEY_PORT   := $(if $(VALKEY_PORT),$(VALKEY_PORT),6379)
 SINK_PORT     ?= $(shell [ -f .env ] && grep -E '^SINK_PORT=' .env | cut -d= -f2 || true)
 SINK_PORT     := $(if $(SINK_PORT),$(SINK_PORT),9090)
+GRAFANA_PORT  ?= $(shell [ -f .env ] && grep -E '^GRAFANA_PORT=' .env | cut -d= -f2 || true)
+GRAFANA_PORT  := $(if $(GRAFANA_PORT),$(GRAFANA_PORT),3000)
+PROMETHEUS_PORT ?= $(shell [ -f .env ] && grep -E '^PROMETHEUS_PORT=' .env | cut -d= -f2 || true)
+PROMETHEUS_PORT := $(if $(PROMETHEUS_PORT),$(PROMETHEUS_PORT),9190)
 
-export API_PORT POSTGRES_PORT VALKEY_PORT SINK_PORT
+export API_PORT POSTGRES_PORT VALKEY_PORT SINK_PORT GRAFANA_PORT PROMETHEUS_PORT
 
 API_URL       ?= http://localhost:$(API_PORT)
 GO            ?= go
@@ -39,7 +43,7 @@ help: ## Show this help
 .PHONY: preflight
 preflight: ## Fail early and clearly if a required host port is taken
 	@fail=0; \
-	for spec in "API_PORT:$(API_PORT)" "POSTGRES_PORT:$(POSTGRES_PORT)" "VALKEY_PORT:$(VALKEY_PORT)"; do \
+	for spec in "API_PORT:$(API_PORT)" "POSTGRES_PORT:$(POSTGRES_PORT)" "VALKEY_PORT:$(VALKEY_PORT)" "GRAFANA_PORT:$(GRAFANA_PORT)" "PROMETHEUS_PORT:$(PROMETHEUS_PORT)"; do \
 		var=$${spec%%:*}; port=$${spec##*:}; \
 		if docker ps --format '{{.Ports}}' 2>/dev/null | grep -q ":$$port->"; then continue; fi; \
 		if ! ./scripts/port-in-use.sh "$$port"; then continue; fi; \
@@ -72,7 +76,10 @@ up: hooks preflight ## Build and start the full stack, then wait until it is ser
 	$(COMPOSE) up -d --build
 	@$(MAKE) --no-print-directory wait
 	@echo ""
-	@echo "  stack is up.  api: $(API_URL)"
+	@echo "  stack is up."
+	@echo "    api:        $(API_URL)"
+	@echo "    grafana:    http://localhost:$(GRAFANA_PORT)   (dashboard already loaded, no login)"
+	@echo "    prometheus: http://localhost:$(PROMETHEUS_PORT)"
 	@echo "  next: make migrate-up && make seed"
 
 .PHONY: wait
@@ -93,6 +100,10 @@ down: ## Stop the stack and delete its volumes
 .PHONY: logs
 logs: ## Follow the API logs
 	$(COMPOSE) logs -f api
+
+.PHONY: dashboard
+dashboard: ## Print the Grafana dashboard URL
+	@echo "http://localhost:$(GRAFANA_PORT)/d/webhook-relay/webhook-relay"
 
 .PHONY: worker-logs
 worker-logs: ## Follow the delivery worker logs

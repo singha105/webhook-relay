@@ -38,6 +38,12 @@ type Endpoint struct {
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// CircuitBreakerState is populated by the API from the shared breaker
+	// state in Valkey, not from a column. It is a live operational fact rather
+	// than stored data — omitted when unknown so a client can tell "closed"
+	// from "we could not ask".
+	CircuitBreakerState string `json:"circuit_breaker_state,omitempty"`
 }
 
 // CreateEndpointRequest is the POST /v1/endpoints body.

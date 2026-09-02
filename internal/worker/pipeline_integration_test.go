@@ -433,3 +433,12 @@ func TestLoadForDeliveryReadsCurrentRows(t *testing.T) {
 		t.Errorf("LoadForDelivery returned URL %q, want the updated %q", target.Endpoint.URL, newURL)
 	}
 }
+
+func uuidMustParse(t *testing.T, s string) uuid.UUID {
+	t.Helper()
+	id, err := uuid.Parse(s)
+	if err != nil {
+		t.Fatalf("uuid.Parse(%q) = %v", s, err)
+	}
+	return id
+}

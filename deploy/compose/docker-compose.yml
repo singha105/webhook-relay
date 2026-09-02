@@ -59,6 +59,10 @@ services:
       DATABASE_URL: "postgres://webhook_relay:webhook_relay@postgres:5432/webhook_relay?sslmode=disable"
       VALKEY_URL: "redis://valkey:6379"
       LOG_LEVEL: "info"
+      OTLP_ENDPOINT: "otel-collector:4317"
+      TRACING_ENABLED: "${TRACING_ENABLED:-true}"
+      SERVICE_VERSION: "${SERVICE_VERSION:-day-3}"
+      READINESS_MAX_BACKLOG_AGE: "${READINESS_MAX_BACKLOG_AGE:-2m}"
     ports:
       # 8080 collides with Apache, Tomcat, and half the tools on a dev laptop,
       # so the host side is overridable via API_PORT in .env.
@@ -103,6 +107,17 @@ services:
       # Exposed as an override because Day 5 turns it off on purpose to
       # demonstrate the duplicate deliveries it prevents.
       DELIVERY_DEDUP_ENABLED: "${DELIVERY_DEDUP_ENABLED:-true}"
+      METRICS_ADDR: ":9100"
+      OTLP_ENDPOINT: "otel-collector:4317"
+      TRACING_ENABLED: "${TRACING_ENABLED:-true}"
+      SERVICE_VERSION: "${SERVICE_VERSION:-day-3}"
+      RATE_LIMIT_ENABLED: "${RATE_LIMIT_ENABLED:-true}"
+      BREAKER_ENABLED: "${BREAKER_ENABLED:-true}"
+      BREAKER_THRESHOLD: "${BREAKER_THRESHOLD:-10}"
+      BREAKER_COOLDOWN: "${BREAKER_COOLDOWN:-5m}"
+      DRAIN_TIMEOUT: "${DRAIN_TIMEOUT:-30s}"
+    ports:
+      - "${WORKER_METRICS_PORT:-9100}:9100"
     depends_on:
       postgres:
         condition: service_healthy
@@ -116,6 +131,152 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Observability. All OSS images, no accounts, no external services.
+  #
+  # Memory limits are set on every one of these because the stack has to fit
+  # alongside Postgres, Valkey, the api and the worker on a laptop. An
+  # unbounded Loki or Prometheus will happily take everything Docker will give
+  # it and then the thing you were trying to observe gets OOM-killed instead.
+  # ---------------------------------------------------------------------------
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.116.1
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ../observability/otel-collector.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "${OTLP_GRPC_PORT:-4317}:4317"
+    depends_on:
+      - tempo
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.7.0
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    user: root
+    volumes:
+      - ../observability/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:3200/ready | grep -q ready"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.3.2
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    user: root
+    volumes:
+      - ../observability/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki_data:/loki
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:3100/ready | grep -q ready"]
+      interval: 5s
+      timeout: 4s
+      retries: 30
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    command: ["-config.file=/etc/promtail/config.yaml"]
+    volumes:
+      - ../observability/promtail.yaml:/etc/promtail/config.yaml:ro
+      # Read-only access to the Docker API for container discovery and log
+      # streaming. Local development only — a real deployment would use the
+      # node's log files or a sidecar, not the daemon socket.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      loki:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=24h"
+      # Required for exemplars: without this the exemplar storage is disabled
+      # and the trace links on the latency panel silently do nothing.
+      - "--enable-feature=exemplar-storage"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ../observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../observability/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:9090/-/healthy | grep -q Healthy"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 448M
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    environment:
+      # Anonymous admin access. This is a local demonstration stack with no
+      # data worth protecting; requiring a login would add a click between
+      # `make up` and a working dashboard, which is exactly what we are trying
+      # to avoid. A real deployment would not do this.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_USERS_DEFAULT_THEME: "dark"
+      GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor"
+      # Land straight on the dashboard rather than on an empty home page.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/webhook-relay.json"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ../grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:3000/api/health | grep -q ok"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 384M
     restart: unless-stopped
 
   # Controllable webhook receiver, for the Day 2 verification. It is a test
@@ -154,3 +315,7 @@ services:
 volumes:
   postgres_data:
   valkey_data:
+  prometheus_data:
+  tempo_data:
+  loki_data:
+  grafana_data:

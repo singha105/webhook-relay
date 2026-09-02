@@ -82,6 +82,12 @@ type ClaimedMessage struct {
 	// "this endpoint keeps returning 500" from "our workers keep dying holding
 	// this job", which are very different incidents.
 	DeliveryCount int64
+
+	// TraceFields carries W3C trace context from the producer, so a delivery
+	// span joins the trace that began at ingest instead of starting a new one.
+	// Empty for messages enqueued before tracing was enabled, which is handled
+	// by starting a fresh root rather than failing.
+	TraceFields map[string]string
 }
 
 // Queue is the contract between the outbox relay and the delivery workers.
@@ -92,6 +98,9 @@ type Queue interface {
 	// Enqueue makes an event available to consumers. It must be safe to call
 	// twice with the same event ID — the relay can crash after enqueueing and
 	// before recording that it did, so duplicates are expected by design.
+	//
+	// Implementations inject the caller's trace context into the message, so
+	// the delivery that eventually happens is part of the same trace.
 	Enqueue(ctx context.Context, eventID uuid.UUID) error
 
 	// Claim takes up to count entries for the named consumer. It returns
@@ -117,6 +126,9 @@ type Queue interface {
 
 	// Depth reports entries not yet delivered to any consumer.
 	Depth(ctx context.Context) (int64, error)
+
+	// Len reports the total number of entries in the stream, delivered or not.
+	Len(ctx context.Context) (int64, error)
 
 	// Pending reports entries claimed but not yet acknowledged.
 	Pending(ctx context.Context) (int64, error)

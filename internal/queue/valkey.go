@@ -9,6 +9,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/singha105/webhook-relay/internal/telemetry"
 )
 
 // Stream and group names. Valkey is protocol-compatible with Redis, so the
@@ -20,9 +22,16 @@ const (
 	// GroupName is the single consumer group. Every worker joins it, so each
 	// entry goes to exactly one worker rather than being fanned out.
 	GroupName = "delivery-workers"
-	// fieldEventID is the only field written per entry.
+	// fieldEventID identifies the event to deliver.
 	fieldEventID = "event_id"
 )
+
+// traceFieldPrefix namespaces propagated trace context inside a stream entry.
+//
+// Prefixed so trace plumbing can never collide with a future payload field,
+// and so a human reading XRANGE output can tell instantly which fields are
+// ours and which belong to OpenTelemetry.
+const traceFieldPrefix = "otel_"
 
 // ValkeyQueue is a Queue backed by a Valkey stream with one consumer group.
 type ValkeyQueue struct {
@@ -95,6 +104,34 @@ func NewValkeyQueue(ctx context.Context, cfg ValkeyConfig) (*ValkeyQueue, error)
 	return q, nil
 }
 
+// errNoGroup is the error Valkey returns when the stream or the consumer group
+// does not exist.
+//
+// It is matched by substring because go-redis surfaces it as a plain error
+// string rather than a typed value. Fragile in principle; the alternative —
+// treating every claim error as possibly-NOGROUP and blindly recreating the
+// group — would paper over real failures.
+const errNoGroup = "NOGROUP"
+
+// recoverGroup recreates the consumer group after it has vanished.
+//
+// This is not hypothetical. A Valkey restart without persistence, a flushed
+// database, or an operator running FLUSHALL all destroy the stream and its
+// group. Without this the workers wedge permanently: XREADGROUP returns NOGROUP
+// forever, delivery stops silently, and the only symptom is a log line — while
+// the relay happily keeps enqueueing, because XADD recreates the stream but not
+// the group.
+//
+// Found the hard way: flushing Valkey mid-demo stopped delivery entirely and
+// the workers never recovered on their own.
+func (q *ValkeyQueue) recoverGroup(ctx context.Context, cause error) bool {
+	if cause == nil || !strings.Contains(cause.Error(), errNoGroup) {
+		return false
+	}
+	// MKSTREAM from "0" — see ensureGroup for why the start id matters.
+	return q.ensureGroup(ctx) == nil
+}
+
 // ensureGroup creates the consumer group, tolerating the case where another
 // replica created it first.
 //
@@ -116,11 +153,21 @@ func (q *ValkeyQueue) ensureGroup(ctx context.Context) error {
 	return fmt.Errorf("create consumer group: %w", err)
 }
 
-// Enqueue appends an event to the stream.
+// Enqueue appends an event to the stream, carrying the caller's trace context.
+//
+// The trace context rides as ordinary string fields. That is the whole reason
+// an event's trace can span ingest and delivery: the consumer extracts these
+// and starts its span as a child of the producer's, rather than opening an
+// unrelated trace that nothing links back.
 func (q *ValkeyQueue) Enqueue(ctx context.Context, eventID uuid.UUID) error {
+	values := map[string]any{fieldEventID: eventID.String()}
+	for k, v := range telemetry.InjectContext(ctx) {
+		values[traceFieldPrefix+k] = v
+	}
+
 	args := &redis.XAddArgs{
 		Stream: q.stream,
-		Values: map[string]any{fieldEventID: eventID.String()},
+		Values: values,
 	}
 	if q.maxLen > 0 {
 		args.MaxLen = q.maxLen
@@ -139,13 +186,21 @@ func (q *ValkeyQueue) Enqueue(ctx context.Context, eventID uuid.UUID) error {
 // context cancellation until it returns, which makes shutdown ragged. The
 // worker owns its own poll interval instead.
 func (q *ValkeyQueue) Claim(ctx context.Context, consumerID string, count int) ([]ClaimedMessage, error) {
-	streams, err := q.client.XReadGroup(ctx, &redis.XReadGroupArgs{
-		Group:    q.group,
-		Consumer: consumerID,
-		Streams:  []string{q.stream, ">"}, // ">" = entries never delivered to anyone
-		Count:    int64(count),
-		Block:    -1, // no blocking
-	}).Result()
+	read := func() ([]redis.XStream, error) {
+		return q.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    q.group,
+			Consumer: consumerID,
+			Streams:  []string{q.stream, ">"}, // ">" = entries never delivered to anyone
+			Count:    int64(count),
+			Block:    -1, // no blocking
+		}).Result()
+	}
+
+	streams, err := read()
+	if err != nil && q.recoverGroup(ctx, err) {
+		// The group was recreated; retry once. A second failure is real.
+		streams, err = read()
+	}
 
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
@@ -218,14 +273,22 @@ const nackParkingConsumer = "nacked"
 // This is the recovery path for a worker killed mid-delivery. XAUTOCLAIM walks
 // the pending list, so it is the mechanism a plain LIST cannot offer.
 func (q *ValkeyQueue) ReclaimStale(ctx context.Context, consumerID string, idleTimeout time.Duration, count int) ([]ClaimedMessage, error) {
-	msgs, _, err := q.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
-		Stream:   q.stream,
-		Group:    q.group,
-		Consumer: consumerID,
-		MinIdle:  idleTimeout,
-		Start:    "0-0",
-		Count:    int64(count),
-	}).Result()
+	autoClaim := func() ([]redis.XMessage, error) {
+		msgs, _, err := q.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+			Stream:   q.stream,
+			Group:    q.group,
+			Consumer: consumerID,
+			MinIdle:  idleTimeout,
+			Start:    "0-0",
+			Count:    int64(count),
+		}).Result()
+		return msgs, err
+	}
+
+	msgs, err := autoClaim()
+	if err != nil && q.recoverGroup(ctx, err) {
+		msgs, err = autoClaim()
+	}
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return nil, ErrEmpty
@@ -274,7 +337,9 @@ func (q *ValkeyQueue) deliveryCount(ctx context.Context, messageID string) (int6
 func (q *ValkeyQueue) Depth(ctx context.Context) (int64, error) {
 	groups, err := q.client.XInfoGroups(ctx, q.stream).Result()
 	if err != nil {
-		if errors.Is(err, redis.Nil) {
+		// A missing stream is a depth of zero, not an error: it simply means
+		// nothing has been enqueued since it was last trimmed away.
+		if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("queue depth: %w", err)
@@ -309,6 +374,23 @@ func (q *ValkeyQueue) Close() error {
 	return q.client.Close()
 }
 
+// Len reports the total entries in the stream, which is what XLEN returns.
+//
+// Distinct from Depth: Depth is the consumer group's lag — work not yet handed
+// to anyone — while Len includes acknowledged entries still inside the MAXLEN
+// window. Depth is what tells you whether workers are keeping up; Len tells you
+// how much history the trim is holding.
+func (q *ValkeyQueue) Len(ctx context.Context) (int64, error) {
+	n, err := q.client.XLen(ctx, q.stream).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("queue length: %w", err)
+	}
+	return n, nil
+}
+
 // toClaimedMessage converts a stream entry, rejecting malformed ones.
 func toClaimedMessage(msg redis.XMessage, deliveryCount int64) (ClaimedMessage, error) {
 	raw, ok := msg.Values[fieldEventID].(string)
@@ -319,12 +401,34 @@ func toClaimedMessage(msg redis.XMessage, deliveryCount int64) (ClaimedMessage, 
 	if err != nil {
 		return ClaimedMessage{}, fmt.Errorf("entry %s has an unparseable event id %q: %w", msg.ID, raw, err)
 	}
+
+	// Strip the namespace back off so the propagator sees the keys it wrote.
+	var traceFields map[string]string
+	for k, v := range msg.Values {
+		if !strings.HasPrefix(k, traceFieldPrefix) {
+			continue
+		}
+		sv, ok := v.(string)
+		if !ok {
+			continue
+		}
+		if traceFields == nil {
+			traceFields = make(map[string]string, 2)
+		}
+		traceFields[strings.TrimPrefix(k, traceFieldPrefix)] = sv
+	}
+
 	return ClaimedMessage{
 		MessageID:     msg.ID,
 		EventID:       id,
 		DeliveryCount: deliveryCount,
+		TraceFields:   traceFields,
 	}, nil
 }
 
 // compile-time check
 var _ Queue = (*ValkeyQueue)(nil)
+
+// StreamKeyFor exposes a queue's stream key. Used by tests that need to
+// manipulate the underlying stream directly to simulate a Valkey wipe.
+func StreamKeyFor(q *ValkeyQueue) string { return q.stream }
