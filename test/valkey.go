@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
@@ -96,4 +97,26 @@ var streamCounter atomic.Uint64
 func uniqueStreamName(t *testing.T) string {
 	t.Helper()
 	return fmt.Sprintf("test:%s:%d", sanitizeIdent(t.Name()), streamCounter.Add(1))
+}
+
+// NewRedisClient returns a raw client on the shared Valkey container, for the
+// components that use it directly rather than through the queue.
+func NewRedisClient(t *testing.T) *redis.Client {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("skipping integration test in -short mode")
+	}
+
+	url, err := startValkey(context.Background())
+	if err != nil {
+		t.Fatalf("valkey container unavailable: %v", err)
+	}
+	opt, err := redis.ParseURL(url)
+	if err != nil {
+		t.Fatalf("parse valkey url: %v", err)
+	}
+	client := redis.NewClient(opt)
+	t.Cleanup(func() { _ = client.Close() })
+	return client
 }
