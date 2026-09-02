@@ -96,7 +96,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "max(webhook_queue_oldest_message_age_seconds)",
+          "expr": "max(webhook_queue_oldest_message_age_seconds) or vector(0)",
           "legendFormat": "oldest",
           "range": true,
           "refId": "A"
@@ -166,7 +166,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "webhook:delivery_success:ratio_rate5m",
+          "expr": "webhook:delivery_success:ratio_rate5m or vector(1)",
           "legendFormat": "success",
           "range": true,
           "refId": "A"
@@ -236,7 +236,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(webhook_queue_depth)",
+          "expr": "sum(webhook_queue_depth) or vector(0)",
           "legendFormat": "depth",
           "range": true,
           "refId": "A"
@@ -306,7 +306,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(increase(webhook_events_dlq_total[1h]))",
+          "expr": "sum(increase(webhook_events_dlq_total[1h])) or vector(0)",
           "legendFormat": "dlq",
           "range": true,
           "refId": "A"
@@ -653,7 +653,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "max(webhook_queue_oldest_message_age_seconds)",
+          "expr": "max(webhook_queue_oldest_message_age_seconds) or vector(0)",
           "legendFormat": "oldest event",
           "range": true,
           "refId": "A"
@@ -703,11 +703,11 @@
                 },
                 "1": {
                   "text": "half-open",
-                  "color": "yellow",
+                  "color": "orange",
                   "index": 1
                 },
                 "2": {
-                  "text": "open",
+                  "text": "OPEN",
                   "color": "red",
                   "index": 2
                 }
@@ -722,7 +722,7 @@
                 "value": null
               },
               {
-                "color": "yellow",
+                "color": "orange",
                 "value": 1
               },
               {
@@ -831,7 +831,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(webhook_rate_limited_total[1m]))",
+          "expr": "sum(rate(webhook_rate_limited_total[1m])) or vector(0)",
           "legendFormat": "rate limited",
           "range": true,
           "refId": "A"
@@ -842,7 +842,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(webhook_events_dlq_total[1m]))",
+          "expr": "sum(rate(webhook_events_dlq_total[1m])) or vector(0)",
           "legendFormat": "dead lettered",
           "range": true,
           "refId": "B"

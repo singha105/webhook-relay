@@ -9,15 +9,15 @@ failure modes — the kind of service Stripe or Svix runs internally.
 
 ---
 
-## Status: Day 2 of 6
+## Status: Day 3 of 6
 
 This repository is being built in public, one day at a time. **Only what is
 described below actually works.** Nothing here is a stub presented as finished.
 
 | | |
 |---|---|
-| ✅ **Working today** | Ingest API, idempotent ingest, transactional outbox, Valkey Streams queue, delivery worker pool, HMAC-SHA256 signing, full-jitter retries, dead letter queue, replay, stale-claim recovery |
-| ⬜ **Not built yet** | Circuit breaker (Day 3), observability (Day 4), Kubernetes and chaos testing (Day 5), load test and postmortem (Day 6). `rate_limit_per_sec` is stored and validated but **not enforced**. |
+| ✅ **Working today** | Everything from Days 1–2, plus per-endpoint rate limiting, per-endpoint circuit breaker, distributed tracing across the queue, Prometheus metrics, a provisioned Grafana dashboard, graceful shutdown, and a defined SLO |
+| ⬜ **Not built yet** | Kubernetes, Helm, Terraform, ArgoCD and chaos testing (Day 5); k6 load test and the postmortem (Day 6). |
 
 The roadmap is at the [bottom of this file](#roadmap).
 
@@ -54,6 +54,9 @@ receiver and run the demonstration:
 ```bash
 make demo-up && make demo
 ```
+
+**Grafana is at [localhost:3000](http://localhost:3000)** with the dashboard
+already loaded — no login, no datasource wiring, no import step.
 
 <details>
 <summary><code>make</code> targets</summary>
@@ -134,6 +137,53 @@ budget resets; the failure history does not disappear.
 The last step recomputes the HMAC with `openssl` and compares it to the `v1=`
 digest we sent. It matches, which means the signature scheme is verifiable by
 anything that can compute an HMAC — not just by our own Go code.
+
+### Watch it happen
+
+![the Grafana dashboard](docs/images/dashboard.png)
+
+Provisioned from [`deploy/grafana/dashboards/webhook-relay.json`](deploy/grafana/dashboards/webhook-relay.json)
+— the JSON on disk is the source of truth, and UI edits are deliberately
+overwritten on reload. The dashboard is code.
+
+The scattered markers on the latency panel are **exemplars**. Each one links a
+histogram observation to the trace that produced it, so a p99 spike is one click
+from the request that caused it.
+
+### Rate limiting, per endpoint
+
+`rate_limit_per_sec` from Day 1 is now enforced. 300 events posted at once to an
+endpoint configured for 10/s:
+
+![per-endpoint rate limiting](docs/images/ratelimit.png)
+
+The first 11 go straight through — that is the token bucket starting full, which
+avoids a cold-start penalty on the first event to any endpoint. After that it
+converges on exactly the configured rate.
+
+A rate-limited delivery **does not consume an attempt**. The receiver never saw
+a request, so there is nothing to record and nothing that should count against
+the retry budget. Without that rule, a customer using exactly the rate they
+configured would eventually have their events dead-lettered for being slow.
+
+### The circuit breaker
+
+![circuit breaker trips and recovers](docs/images/breaker.png)
+
+Note the middle rows: while the breaker is open, `attempts_reaching_sink` is
+frozen at 13. Not slowed — stopped. That is the point.
+
+`consecutive_failures` overshot the threshold of 10 and tripped at 13, because
+ten worker goroutines were in flight when it crossed. The breaker permits that
+overshoot; what it does not permit is a *probe* stampede, which is why the
+half-open transition is a Lua script.
+
+### One trace, from ingest to the third attempt
+
+![a single trace spanning ingest and three delivery attempts](docs/images/trace.png)
+
+One root span, zero orphans, across two services. The offsets show the retry
+backoff directly.
 
 ### Everything self-probes
 
@@ -417,10 +467,189 @@ tests, so the two paths cannot drift.
 
 ### Liveness and readiness are not the same probe
 
-`/healthz` touches no dependency. A liveness probe that checked Postgres would
-restart every API pod during a database blip, turning a recoverable outage into
-a cluster-wide crash loop that also drops in-flight requests. `/readyz` pings
-Postgres and pulls the pod out of the Service without killing it.
+They answer different questions, and Kubernetes does different things with the
+answers.
+
+| | Question | Failure action |
+|---|---|---|
+| `/healthz` | Is this process broken beyond recovery? | Container is **killed and restarted** |
+| `/readyz` | Should traffic go here *right now*? | Pod is **removed from the Service**, keeps running |
+
+**What breaks if you conflate them.** Point liveness at the database, then give
+the database a thirty-second blip. Every replica fails liveness simultaneously
+and Kubernetes kills all of them at once. That:
+
+1. **Drops every in-flight request and delivery**, turning a recoverable
+   dependency blip into real data-movement failures.
+2. **Starts a crash loop.** The restarted pods still cannot reach the database,
+   fail again, and get killed again — now with exponential backoff on restarts,
+   so recovery is delayed well past the database's own.
+3. **Destroys the evidence.** The logs and in-memory state of the pods that saw
+   the failure are gone.
+
+The failure mode is worst precisely when the dependency recovers: the database
+comes back and, instead of the fleet resuming, it is midway through a
+`CrashLoopBackOff` cycle keeping it down for minutes longer.
+
+The reverse conflation — readiness that checks nothing — is quieter but also
+wrong: a pod that cannot reach Postgres stays in the Service and returns errors
+that a healthy replica could have served.
+
+So: **liveness checks only that the process is running its own event loop.**
+**Readiness checks the dependencies this process needs to do useful work.**
+
+The two binaries deliberately differ:
+
+- **API readiness** includes a backlog check. Shedding ingest while the workers
+  catch up beats accepting events we already know we cannot deliver on time.
+- **Worker readiness** deliberately does **not**. A worker with a deep backlog is
+  the thing working on it; pulling it from the Service would only slow recovery.
+
+### Rate limiting and the breaker both fail *open*
+
+If Valkey is unreachable, deliveries proceed. Both are protections for the
+receiver and optimizations for us — refusing every delivery because a cache is
+down would convert a degraded dependency into a total outage. The failure is
+logged, never silent.
+
+### Two Lua scripts, for the same reason
+
+Both the token bucket and the breaker's half-open transition are
+read-modify-write against a key that every worker goroutine in every replica is
+racing.
+
+- **Token bucket:** two workers can both read "1 token left" and both proceed, so
+  an endpoint configured for 10/s quietly receives 20. `WATCH`/`MULTI`/`EXEC`
+  would be correct but degrades into a retry storm under exactly the contention
+  that makes a limiter matter.
+- **Half-open probe:** when the cooldown expires, every worker checks at once. If
+  they all read "cooldown elapsed" they all probe — delivering the precise
+  stampede the breaker exists to prevent, at the worst possible moment. `SET NX`
+  on a probe key makes the winner unique.
+
+Time inside the bucket script comes from `redis.call('TIME')`, not from the
+caller: a worker whose clock runs two seconds fast would credit itself two extra
+seconds of tokens on every call.
+
+### Tracing across the outbox needs durable context
+
+This is the part that is easy to get wrong, and it is not solvable with
+in-process propagation.
+
+The outbox decouples ingest from enqueue on purpose: ingest writes a row and
+returns; a background relay picks that row up later. So by construction the
+relay has **no in-memory link** to the request that created the event — it is a
+different goroutine, usually a different process, running minutes later.
+
+Passing `context.Context` around cannot bridge that. The W3C trace carrier has
+to be as durable as the event, so it lives in `events.trace_context`
+([migration 000004](migrations/000004_event_trace_context.up.sql)). The relay
+rehydrates it when claiming, `Enqueue` injects it into the stream entry as
+ordinary string fields, and the worker extracts it before starting its span.
+
+Without it every delivery opens its own unconnected trace: you can see that an
+ingest happened and that a delivery happened, with no way to tell they were the
+same event — which is exactly the question you are asking when something is
+wrong.
+
+---
+
+## Service level objective
+
+> **99% of events are delivered within 30 seconds of ingest, measured over a
+> rolling 7 days.**
+
+Three deliberate choices in that sentence:
+
+- **From ingest, not from dequeue.** The customer's clock starts when they hand
+  us the event. Measuring from when *we* got around to scheduling it would let
+  us hide a backlog by not looking at it.
+- **Delivered, not attempted.** A 5xx that is retried and eventually succeeds
+  inside 30 seconds met the objective. The customer does not care how many
+  attempts it took.
+- **7 days, not 30.** Long enough that one bad afternoon does not dominate,
+  short enough that the budget resets while the incident is still remembered.
+
+### Measuring it
+
+The SLI is the fraction of delivery attempts that succeeded, read from the
+histogram's cumulative buckets rather than from a quantile — a quantile answers
+"what is the value at rank p", which cannot tell you "what fraction met the
+target".
+
+```promql
+# SLI: proportion of successful deliveries over the SLO window.
+sum(rate(webhook_delivery_attempts_total{status_class="2xx"}[7d]))
+/
+sum(rate(webhook_delivery_attempts_total[7d]))
+```
+
+That covers "delivered". The "within 30 seconds" half is the backlog gauge,
+because end-to-end latency is exactly how long the oldest undelivered event has
+been waiting:
+
+```promql
+# Fraction of time the backlog stayed inside the 30s objective.
+avg_over_time(
+  (max(webhook_queue_oldest_message_age_seconds) < bool 30)[7d:1m]
+)
+```
+
+Both are precomputed as [recording rules](deploy/observability/rules/webhook-relay.yml).
+A panel and an alert that compute the SLO with slightly different expressions
+will eventually disagree, and at that point nobody trusts either.
+
+### The error budget
+
+A 99% objective over 7 days permits **1% of events to miss the target**.
+
+| | |
+|---|---|
+| Window | 7 days = 10,080 minutes |
+| Objective | 99% |
+| Error budget | 1% = **100.8 minutes** of total unavailability |
+| At 100 events/s | 1% of ~60.5M events = **~604,800 events** may miss |
+
+Budget *consumed* so far in the window:
+
+```promql
+# 0 = untouched, 1 = fully spent, >1 = objective missed.
+(
+  1 - (
+    sum(rate(webhook_delivery_attempts_total{status_class="2xx"}[7d]))
+    /
+    sum(rate(webhook_delivery_attempts_total[7d]))
+  )
+) / 0.01
+```
+
+### Burn rate, and why the alert uses two windows
+
+Burn rate is how fast the budget is being spent relative to sustainable. A burn
+rate of 1 exhausts the budget exactly at the end of the window; a burn rate of
+14.4 exhausts a 30-day budget in about two days.
+
+```promql
+# Fast burn: 14.4x sustainable, confirmed over both a short and a long window.
+(
+  (1 - webhook:delivery_success:ratio_rate5m) > (14.4 * 0.01)
+  and
+  (1 - webhook:delivery_success:ratio_rate1h) > (14.4 * 0.01)
+)
+```
+
+The `and` across a 5-minute and a 1-hour window is the point. The short window
+alone pages on a single bad minute; the long window alone takes an hour to
+notice a total outage. Requiring both means the alert is **fast to fire and slow
+to flap** — it needs the failure to be both sudden and sustained.
+
+### What the budget is *for*
+
+An error budget that is never spent means the objective is too loose, or too
+much engineering is going into reliability that customers cannot perceive.
+Budget remaining is permission to ship; budget exhausted is a signal to stop
+shipping features and fix delivery. That is the entire reason to state a number
+rather than "we try hard".
 
 ---
 
@@ -500,8 +729,8 @@ test/sink/          controllable webhook receiver for tests and the demo
 |---|---|
 | **1** ✅ | Ingest API, schema, idempotency, local stack, CI |
 | **2** ✅ | Outbox relay, Valkey Streams, delivery worker, HMAC signing, full-jitter retries, DLQ, replay |
-| **3** | Per-endpoint circuit breaker and rate limiting |
-| **4** | OpenTelemetry → Prometheus, Tempo, Loki, Grafana |
+| **3** ✅ | Rate limiting, circuit breaker, tracing, metrics, Grafana, graceful shutdown, SLO |
+| **4** | Merged into Day 3 — the observability stack is already running |
 | **5** | k3d + Helm + Terraform + ArgoCD; Chaos Mesh fault injection |
 | **6** | k6 load test, benchmark numbers, and the postmortem |
 
@@ -520,15 +749,23 @@ Stated plainly rather than discovered by a reviewer:
 - **No SSRF protection.** Endpoint URLs may point at loopback and private
   ranges, which is required for local testing but would need an egress allowlist
   in a hosted deployment.
-- **No rate limiting yet.** `rate_limit_per_sec` is stored, validated, and read
-  by the worker, but nothing throttles on it. A busy endpoint can be hit as fast
-  as the pool can dispatch. Day 3.
-- **No circuit breaker yet.** `consecutive_failures` is maintained correctly but
-  nothing reads it to stop delivering. An endpoint that has been down for an
-  hour still gets the full retry schedule for every event. Day 3.
 - **Delivery is at-least-once, deliberately.** The dedup guard narrows the
   duplicate window; it does not eliminate it. Receivers must deduplicate on
   `X-Webhook-Id`.
+- **`endpoint_id` is a metric label.** That is one series per endpoint on four
+  metrics. Fine for the tens of endpoints this targets, a cardinality problem at
+  thousands. The breaker gauge is explicitly bounded at 500 series; the latency
+  histogram deliberately omits the label entirely.
+- **Grafana runs with anonymous admin access.** Correct for a local demo where a
+  login stands between `make up` and a working dashboard; not something to
+  deploy.
+- **Tracing samples at 100%.** Right at this volume and for a demonstration.
+  Real traffic needs head or tail sampling.
+- **The breaker can overshoot its threshold.** Ten concurrent goroutines can
+  push `consecutive_failures` past 10 before the open takes effect. Deliberate:
+  making the trip exact would need a lock on the hot path, and a few extra
+  failed requests are cheaper than that. The *probe* is exact, which is the part
+  that matters.
 - **Offset pagination** on `GET /v1/endpoints` drifts under concurrent inserts.
   Acceptable because endpoints are registered by humans, not by traffic. The
   events table would need keyset pagination.

@@ -12,6 +12,15 @@ import (
 	"github.com/singha105/webhook-relay/internal/models"
 )
 
+// DueEvent is a claimed event plus the trace context captured at ingest.
+type DueEvent struct {
+	ID uuid.UUID
+	// TraceContext is the W3C carrier stored when the event was ingested. Nil
+	// when the event predates tracing or tracing was disabled, in which case
+	// the delivery starts a fresh root rather than failing.
+	TraceContext map[string]string
+}
+
 // ClaimDueEvents takes up to limit events that are ready for delivery, marks
 // them 'delivering', and stamps a lease.
 //
@@ -53,15 +62,6 @@ import (
 //
 // SKIP LOCKED is what lets several relay replicas run concurrently: each takes
 // a disjoint set of rows instead of blocking on the same ones.
-// DueEvent is a claimed event plus the trace context captured at ingest.
-type DueEvent struct {
-	ID uuid.UUID
-	// TraceContext is the W3C carrier stored when the event was ingested. Nil
-	// when the event predates tracing or tracing was disabled, in which case
-	// the delivery starts a fresh root rather than failing.
-	TraceContext map[string]string
-}
-
 func (s *Store) ClaimDueEvents(ctx context.Context, limit int, lease time.Duration) ([]DueEvent, error) {
 	const q = `
 		WITH due AS (
