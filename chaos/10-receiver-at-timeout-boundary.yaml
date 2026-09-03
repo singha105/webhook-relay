@@ -1,0 +1,49 @@
+# Experiment 10 - a receiver that answers 200 after 9.9 seconds, against a
+# 10-second client timeout.
+#
+# The nastiest case in the set, because it is not a failure - it is a SUCCESS
+# that arrives 100ms before we give up. Any clock skew, GC pause, or scheduling
+# delay flips it to a timeout.
+#
+# No Chaos Mesh fault needed: the test sink already takes a configurable delay,
+# which is a more precise instrument than injected network latency because it
+# controls the RESPONSE time rather than the round trip.
+#
+# PREDICTION
+# Most deliveries succeed, some time out, and the ones that time out are
+# RETRIED - which means the receiver processes them TWICE. This is the
+# at-least-once contract meeting reality: we cannot distinguish "the receiver
+# never got it" from "the receiver got it and the response was lost", so we
+# retry, and a receiver that is not idempotent double-processes.
+#
+# The delivery-side dedup guard does NOT help here. It suppresses a duplicate
+# dispatch of the same ATTEMPT; a timeout produces a legitimate NEXT attempt
+# with a new number. Only the receiver deduplicating on X-Webhook-Id prevents
+# double-processing - which is exactly why pkg/webhook tells them to.
+#
+# WHAT WOULD FALSIFY IT
+# Zero duplicate receipts at the sink (would mean timeouts are not being
+# retried), or every request timing out (would mean the timeout is not 10s).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: receiver-at-timeout-boundary
+  namespace: chaos-testing
+data:
+  README: |
+    Run against the test sink, which takes a response delay directly:
+
+      curl -X POST http://localhost:9091/_control/behavior \
+        -H 'Content-Type: application/json' \
+        -d '{"status":200,"delay":"9.9s"}'
+
+    Then post events and compare, at the sink's recorder:
+
+      total deliveries received   vs   events marked delivered
+
+    A gap between them is double-processing caused by retried timeouts.
+
+    Reset with:
+
+      curl -X POST http://localhost:9091/_control/behavior \
+        -H 'Content-Type: application/json' -d '{"status":200}'

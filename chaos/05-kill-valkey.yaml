@@ -1,0 +1,34 @@
+# Experiment 5 - kill the Valkey pod.
+#
+# PREDICTION
+# This is the one the architecture was explicitly designed for. Valkey holds
+# the queue, the rate-limit buckets, the breaker state and the dedup keys, and
+# it runs with NO persistence - so killing it loses all of that.
+#
+# Expected: claimed-but-unacked stream entries are gone, and so is the consumer
+# group. The workers should hit NOGROUP, RECREATE the group, and carry on
+# (the fix from Day 3). The events themselves are untouched because Postgres is
+# the system of record - they sit in 'delivering' with a lease, and when that
+# lease expires the outbox relay requeues them. Nothing is lost; the affected
+# events are delayed by up to one lease period (5m).
+#
+# Rate limiting and breakers reset to their default state, which is safe: a
+# fresh bucket starts full and a fresh breaker starts closed.
+#
+# WHAT WOULD FALSIFY IT
+# Workers wedged on NOGROUP forever (the Day 3 fix regressed), or events stuck
+# in 'delivering' permanently (the lease sweep is not running).
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: kill-valkey
+  namespace: chaos-testing
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - webhook-relay
+    labelSelectors:
+      app.kubernetes.io/name: valkey
+  gracePeriod: 0

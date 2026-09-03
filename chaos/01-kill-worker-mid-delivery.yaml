@@ -1,0 +1,33 @@
+# Experiment 1 - kill a worker pod mid-delivery, under load.
+#
+# PREDICTION
+# No events lost. The killed worker holds claimed-but-unacked stream entries;
+# those sit in the consumer group's pending list until the stale-claim timeout
+# (60s), then XAUTOCLAIM hands them to a surviving worker. Expect a delivery
+# latency spike of roughly the stale timeout for the affected events and -
+# because the killed worker may already have sent the HTTP request before dying
+# - expect the delivery-side dedup guard to suppress a duplicate on redelivery.
+# Net: zero loss, zero duplicates, a latency bump.
+#
+# WHAT WOULD FALSIFY IT
+# Events stuck in 'delivering' forever (the lease is not working), or the sink
+# recording the same (event, attempt) pair twice (dedup is not working).
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: kill-worker-mid-delivery
+  namespace: chaos-testing
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - webhook-relay
+    labelSelectors:
+      # Labels, not a pod name: names change every rollout, and a manifest
+      # pinned to one silently selects nothing a week later.
+      app.kubernetes.io/name: webhook-relay
+      app.kubernetes.io/component: worker
+  # gracePeriod 0 is the point. A graceful SIGTERM would let the worker drain,
+  # which Day 3 already tested. This is the ungraceful case.
+  gracePeriod: 0

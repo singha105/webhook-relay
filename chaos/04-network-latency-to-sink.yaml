@@ -1,0 +1,50 @@
+# Experiment 4 - 30s of latency toward the receiver, against a 10s client
+# timeout.
+#
+# PREDICTION
+# Every delivery times out at 10s. Each worker goroutine is blocked for the
+# full 10s, so with concurrency 10 the pool sustains at most 1 delivery/sec
+# instead of hundreds - effectively a stall. Queue depth runs away, backlog age
+# climbs past the 30s SLO, and WebhookBacklogAgeOverSLO fires.
+#
+# The interesting part is what does NOT happen: a timeout is classified
+# retryable with a nil status code, so events should be RETRIED with backoff
+# rather than dead-lettered, and after six attempts they land in the DLQ.
+# Because the endpoint keeps failing, the circuit breaker should open after 10
+# consecutive failures and stop the bleeding - after which workers stop
+# blocking on it entirely and the pool frees up.
+#
+# So the predicted shape is: stall, then breaker opens, then the pool recovers
+# even though the endpoint is still broken. That last transition is the whole
+# reason the breaker exists.
+#
+# WHAT WOULD FALSIFY IT
+# The pool never recovering (breaker not opening), or events dead-lettered on
+# the first timeout (timeouts misclassified as permanent).
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: latency-to-sink
+  namespace: chaos-testing
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - webhook-relay
+    labelSelectors:
+      app.kubernetes.io/name: webhook-relay
+      app.kubernetes.io/component: worker
+  direction: to
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - webhook-relay
+      labelSelectors:
+        app: sink
+  delay:
+    latency: "30s"
+    correlation: "0"
+    jitter: "0ms"
+  duration: "3m"
