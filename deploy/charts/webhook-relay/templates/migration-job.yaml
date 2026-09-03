@@ -54,7 +54,24 @@ spec:
         {{- include "webhook-relay.componentLabels" (dict "root" . "component" "migrate") | nindent 8 }}
     spec:
       restartPolicy: Never
-      serviceAccountName: {{ include "webhook-relay.serviceAccountName" . }}
+
+      # Deliberately NOT the application's ServiceAccount.
+      #
+      # Helm creates non-hook resources AFTER pre-install/pre-upgrade hooks
+      # run, so referencing the chart's own ServiceAccount here fails on a
+      # first install with:
+      #   pods "webhook-relay-migrate-1-" is forbidden: error looking up
+      #   service account webhook-relay/webhook-relay: not found
+      # ArgoCD then sits at "waiting for completion of hook" until the job's
+      # deadline expires.
+      #
+      # The fix is not to make the ServiceAccount a hook too — it is to
+      # recognise that this Job needs no Kubernetes API access whatsoever. It
+      # connects to Postgres and runs SQL. `default` with the token unmounted
+      # is both correct and strictly less privileged.
+      serviceAccountName: default
+      automountServiceAccountToken: false
+
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
