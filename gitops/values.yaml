@@ -1,0 +1,17 @@
+# The deployed image tag.
+#
+# THIS FILE IS WRITTEN BY CI, NOT BY HAND.
+#
+# release.yml builds an image, pushes it to GHCR tagged with the git SHA, and
+# then commits a change to this file. That commit is the deployment: ArgoCD sees
+# it, syncs, and the new image rolls out.
+#
+# The indirection is the point. CI never talks to the cluster — it only writes
+# to Git — so no GitHub Actions runner ever holds a kubeconfig. See the README
+# section "Why pull-based delivery is more secure".
+image:
+  repository: ghcr.io/singha105/webhook-relay
+  # Overwritten by CI with sha-<short-sha>. The placeholder is a real tag that
+  # will fail to pull rather than a mutable one that would silently deploy
+  # something unknown.
+  tag: "sha-bootstrap"

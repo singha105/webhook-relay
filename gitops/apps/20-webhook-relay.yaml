@@ -1,0 +1,64 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: webhook-relay
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  finalizers:
+    # Without this, deleting the Application leaves every Deployment, Service
+    # and NetworkPolicy behind as orphans.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/singha105/webhook-relay.git
+    targetRevision: main
+    path: deploy/charts/webhook-relay
+    helm:
+      releaseName: webhook-relay
+      valueFiles:
+        - values.yaml
+        # The image tag CI writes. A second values file rather than a
+        # parameter override, so `git log gitops/values.yaml` is a deployment
+        # history in one command.
+        - ../../../gitops/values.yaml
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: webhook-relay
+
+  syncPolicy:
+    automated:
+      # prune: delete resources removed from Git. Without it, renaming a
+      # resource leaves the old one running forever.
+      prune: true
+      # selfHeal: revert manual changes. This is what makes
+      # `kubectl delete deployment` a demo rather than an outage.
+      selfHeal: true
+      # Do not prune on a sync that had errors — a transient repo-server
+      # failure should not delete the running application.
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=false
+      - ApplyOutOfSyncOnly=true
+      # Helm hooks (the migration Job) are deleted by Helm's own policy, not
+      # by ArgoCD's pruning, which would race it.
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
+
+  ignoreDifferences:
+    # The HPA owns the replica count. Without this ArgoCD sees every scaling
+    # decision as drift and reverts it, which with selfHeal enabled means the
+    # autoscaler and ArgoCD fight in a loop.
+    - group: apps
+      kind: Deployment
+      name: webhook-relay-api
+      jsonPointers:
+        - /spec/replicas
