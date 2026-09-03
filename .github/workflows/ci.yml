@@ -302,7 +302,7 @@ jobs:
             aquasec/trivy:0.58.1 config \
               --severity CRITICAL \
               --exit-code 1 \
-              --no-progress \
+              --quiet \
               /scan
 
   stack:
