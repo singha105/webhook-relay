@@ -1,0 +1,58 @@
+# Low-memory profile: 1 server, 1 agent.
+#
+# Use when Docker has less than ~5 GiB. Pair it with the matching Terraform
+# variables, which drop Loki, run a single Postgres instance, and shorten
+# Prometheus retention:
+#
+#   make cluster-up PROFILE=lowmem
+#   make bootstrap  PROFILE=lowmem
+#
+# What you give up: no Postgres failover to demonstrate (one instance cannot
+# fail over), no log aggregation, and 6h of metrics history instead of 24h.
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: webhook-relay
+
+servers: 1
+agents: 1
+
+image: docker.io/rancher/k3s:v1.31.4-k3s1
+
+registries:
+  create:
+    name: webhook-relay-registry
+    host: "0.0.0.0"
+    hostPort: "5111"
+  config: |
+    mirrors:
+      "webhook-relay-registry:5000":
+        endpoint:
+          - http://webhook-relay-registry:5000
+
+ports:
+  - port: "8081:80"
+    nodeFilters:
+      - loadbalancer
+  - port: "8443:443"
+    nodeFilters:
+      - loadbalancer
+
+options:
+  k3d:
+    wait: true
+    timeout: "300s"
+  k3s:
+    extraArgs:
+      - arg: --disable=traefik
+        nodeFilters:
+          - server:*
+      - arg: --disable=servicelb
+        nodeFilters:
+          - server:*
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true
+  runtime:
+    serversMemory: 1800m
+    agentsMemory: 1800m
