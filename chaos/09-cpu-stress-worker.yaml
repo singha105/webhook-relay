@@ -1,0 +1,40 @@
+# Experiment 9 - CPU pressure on a worker.
+#
+# PREDICTION
+# The Helm chart deliberately sets NO CPU limit on either workload, only a
+# request - the reasoning is in values.yaml: a CPU limit throttles rather than
+# kills, and CFS throttling on a latency-sensitive path produces tail latency
+# that looks like a network fault.
+#
+# So the prediction is that the pod is NOT throttled and NOT OOMKilled. It
+# competes for CPU with the stressor and gets slower, delivery throughput
+# drops, but nothing is killed and nothing is lost. The memory limit is
+# untouched by CPU stress, so OOMKill should not occur.
+#
+# This experiment exists to check that the no-CPU-limit decision behaves the
+# way the comment claims, rather than being an untested assertion.
+#
+# WHAT WOULD FALSIFY IT
+# An OOMKill (which would mean memory limits are too tight under load), or
+# evidence of CFS throttling (which would mean a CPU limit is being applied
+# from somewhere the chart does not control).
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: cpu-stress-worker
+  namespace: chaos-testing
+spec:
+  mode: one
+  selector:
+    namespaces:
+      - webhook-relay
+    labelSelectors:
+      app.kubernetes.io/name: webhook-relay
+      app.kubernetes.io/component: worker
+  stressors:
+    cpu:
+      # More workers than the node has cores, so the stressor genuinely
+      # contends rather than fitting in spare capacity.
+      workers: 4
+      load: 100
+  duration: "2m"

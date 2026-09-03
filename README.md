@@ -9,15 +9,19 @@ failure modes — the kind of service Stripe or Svix runs internally.
 
 ---
 
-## Status: Day 4 of 6
+## Status: Day 5 of 6
 
 This repository is being built in public, one day at a time. **Only what is
 described below actually works.** Nothing here is a stub presented as finished.
 
 | | |
 |---|---|
-| ✅ **Working today** | Everything from Days 1–3, plus a k3d cluster from a committed config, Terraform-provisioned infrastructure, a Helm chart, GitOps delivery with ArgoCD, signed images with SBOMs, NetworkPolicies, alert rules, and an on-call runbook |
-| ⬜ **Not built yet** | Chaos experiments (Day 5); k6 load test and the postmortem (Day 6). |
+| ✅ **Working today** | Everything from Days 1–4, plus k6 load-test scenarios, a measured delivery bottleneck with a before/after fix, ten chaos experiments with predictions committed before the runs, and a duplicate-delivery postmortem backed by reproducible evidence |
+| ⬜ **Not built yet** | Day 6: the write-up pass and whatever the numbers say needs fixing. |
+
+**Every number in this repository comes from a run you can reproduce with a
+committed script.** Where an experiment could not run on this hardware, it says
+so rather than showing a figure.
 
 The roadmap is at the [bottom of this file](#roadmap).
 
@@ -959,6 +963,93 @@ test/sink/          controllable webhook receiver for tests and the demo
 
 ---
 
+## Load testing and chaos
+
+Two questions this day set out to answer with measurements rather than
+assertions: how fast is it, and what breaks it.
+
+### How fast
+
+k6 scenarios in [`loadtest/`](loadtest/) — smoke, baseline, a 0→5000/s ramp,
+and a 30-minute soak. The ramp deliberately does **not** inherit the p95<50ms
+threshold: a ramp that must stay fast would fail at the knee it exists to find.
+
+Measured on an Apple M3 (8 cores, 8 GB) with Docker limited to 3.825 GiB. These
+are single-machine numbers and they reflect local hardware; a defensible small
+number beats an inflated one.
+
+| | |
+|---|---|
+| Ingest, sustained | ~875 events/sec |
+| Delivery, sustained | ~870 events/sec |
+
+### The bottleneck, and the part still unexplained
+
+The first three hypotheses were all wrong, and the elimination is the
+interesting part. Raising the pgx pool did nothing. Raising worker concurrency
+did nothing. Raising both together did nothing. `docker stats` during a drain
+then showed **nothing was saturated** — worker and Postgres each at ~124% of
+800% available — so the system is latency-bound on sequential round trips, not
+short of capacity.
+
+That pointed at the relay, which is the sole queue producer for the whole
+system and was enqueueing one event per round trip in a serial loop.
+
+| Configuration | Median |
+|---|---|
+| Baseline (serial enqueue) | 769.2 events/sec |
+| Pipelined enqueue | **810.8 events/sec** (+5.4%) |
+| Pipelined + concurrency 50 / pool 60 | **869.6 events/sec** (+13.1%) |
+
+The caveat is stated rather than buried: 5× the concurrency still buys only 7%
+on an unsaturated machine, so a serialization point remains that this day did
+not isolate. Ranked candidates, the full elimination trail, and three
+experiments that turned out to be measuring nothing at all are in
+[`loadtest/README.md`](loadtest/README.md).
+
+### What breaks it
+
+Ten experiments in [`chaos/`](chaos/), each with a prediction and a
+falsification criterion committed *before* it ran. Results:
+[`docs/chaos-results.md`](docs/chaos-results.md).
+
+**The headline — duplicate deliveries.** Kill a worker between "request sent"
+and "queue entry acknowledged" and the entry is reclaimed and sent again. Same
+scenario twice, 300 events, the only difference being the dedup guard:
+
+```
+dedup disabled -> 300 deliveries, 292 distinct events, 8 duplicates
+dedup enabled  -> 300 deliveries, 300 distinct events, 0 duplicates
+```
+
+The receiver did 300 units of work for 292 events. Full analysis in
+[`docs/postmortem-duplicate-delivery.md`](docs/postmortem-duplicate-delivery.md).
+
+**Where a prediction was wrong.** Experiment 10 put a receiver at the timeout
+boundary — 9.9s against a 10s timeout — and predicted double-processing. It
+produced a perfectly clean run: 30 events, 30 attempts, zero timeouts. The
+mechanism was reasoned correctly and then tested with a parameter that never
+triggers it, because 100ms of headroom exceeds any jitter on a local bridge.
+
+Re-run at 10.4s, which does cross:
+
+```
+10 events, 15 attempts, 15 timeouts, 0 recorded deliveries
+the receiver actually processed 15 requests, 8 distinct
+```
+
+**The receiver succeeded 15 times and the system recorded zero successes.** The
+dedup guard correctly does not fire — each retry is a genuinely new attempt
+number, not a duplicate dispatch of the same one. This is the outer boundary of
+what sender-side deduplication can do.
+
+Five experiments are recorded as NOT RUN. They need Chaos Mesh or a 3-replica
+Postgres cluster, and this machine has 3.825 GiB against the ~6 GiB the full
+profile needs. Their manifests and predictions are committed unresolved rather
+than given invented results.
+
+---
+
 ## Roadmap
 
 | Day | Deliverable |
@@ -967,8 +1058,8 @@ test/sink/          controllable webhook receiver for tests and the demo
 | **2** ✅ | Outbox relay, Valkey Streams, delivery worker, HMAC signing, full-jitter retries, DLQ, replay |
 | **3** ✅ | Rate limiting, circuit breaker, tracing, metrics, Grafana, graceful shutdown, SLO |
 | **4** ✅ | k3d + Terraform + Helm + ArgoCD, signed images, NetworkPolicies, alerts, runbook |
-| **5** | Chaos Mesh fault injection against all of it |
-| **6** | k6 load test, benchmark numbers, and the postmortem |
+| **5** ✅ | k6 load tests, the bottleneck hunt and its fix, chaos experiments, the duplicate-delivery postmortem |
+| **6** | Final write-up pass |
 
 `endpoints.consecutive_failures` is already maintained by the worker — reset on
 success, incremented on failure — so Day 3's circuit breaker reads a counter
@@ -1011,6 +1102,16 @@ Stated plainly rather than discovered by a reviewer:
   making the trip exact would need a lock on the hot path, and a few extra
   failed requests are cheaper than that. The *probe* is exact, which is the part
   that matters.
+- **A serialization point in delivery is unidentified.** 5× the worker
+  concurrency buys 7% on a machine where nothing is CPU-saturated. The relay
+  pipelining fix was real but not the whole story; ranked next candidates are in
+  [`loadtest/results/optimization-relay-pipelining.md`](loadtest/results/optimization-relay-pipelining.md).
+- **Half the chaos experiments have not run.** Five of ten need Chaos Mesh or a
+  multi-replica Postgres, neither of which fits in 3.825 GiB. Predictions are
+  committed and unresolved.
+- **`payload: null` is accepted.** It is valid JSON and passes validation, so it
+  is stored and delivered as the four bytes `null`. Defensible — payloads are
+  opaque by design — but probably not intentional.
 - **Offset pagination** on `GET /v1/endpoints` drifts under concurrent inserts.
   Acceptable because endpoints are registered by humans, not by traffic. The
   events table would need keyset pagination.

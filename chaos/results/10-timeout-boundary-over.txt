@@ -1,0 +1,18 @@
+NOTICE:  truncate cascades to table "events"
+NOTICE:  truncate cascades to table "delivery_attempts"
+  sink responds 200 after 10.4s; client timeout is 10s
+  posting 10 events
+  waiting for the pipeline to settle (this is slow by construction)...
+
+  events posted:                    10
+  our records: delivered            0
+  our records: dead-lettered        0
+  our records: total attempts       15
+  our records: timeouts (null code) 15
+  the RECEIVER actually processed   15   (distinct events: 8)
+
+  double-processed by the receiver: 5
+
+  Every one of those is a delivery we timed out on, retried, and the
+  receiver had already handled. This is the at-least-once contract
+  meeting reality; only receiver-side dedup on X-Webhook-Id fixes it.

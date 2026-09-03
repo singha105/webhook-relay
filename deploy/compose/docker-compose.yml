@@ -63,6 +63,7 @@ services:
       TRACING_ENABLED: "${TRACING_ENABLED:-true}"
       SERVICE_VERSION: "${SERVICE_VERSION:-day-3}"
       READINESS_MAX_BACKLOG_AGE: "${READINESS_MAX_BACKLOG_AGE:-2m}"
+      DB_MAX_CONNS: "${DB_MAX_CONNS:-10}"
     ports:
       # 8080 collides with Apache, Tomcat, and half the tools on a dev laptop,
       # so the host side is overridable via API_PORT in .env.
@@ -100,6 +101,11 @@ services:
       VALKEY_URL: "redis://valkey:6379"
       LOG_LEVEL: "info"
       WORKER_CONCURRENCY: "${WORKER_CONCURRENCY:-10}"
+      # Exposed so the load-test harness can vary it. The pool must exceed
+      # WORKER_CONCURRENCY: the delivery goroutines and the outbox relay share
+      # one pool, so a pool equal to the concurrency leaves the relay with
+      # nothing and it blocks waiting for a connection a worker is holding.
+      DB_MAX_CONNS: "${DB_MAX_CONNS:-10}"
       MAX_ATTEMPTS: "${MAX_ATTEMPTS:-6}"
       RETRY_BASE_DELAY: "${RETRY_BASE_DELAY:-1s}"
       RETRY_MAX_DELAY: "${RETRY_MAX_DELAY:-1h}"

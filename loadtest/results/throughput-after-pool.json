@@ -1,0 +1,12 @@
+{
+  "label": "after-pool",
+  "events": 5000,
+  "backlog_at_drain_start": 5000,
+  "ingest_seconds": 16.3,
+  "drain_seconds": 13.2,
+  "delivered": 5000,
+  "dead_lettered": 0,
+  "sink_received": 5000,
+  "duplicate_dispatches": 0,
+  "delivery_throughput_per_sec": 378.8
+}

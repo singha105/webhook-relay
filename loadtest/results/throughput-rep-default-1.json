@@ -1,0 +1,12 @@
+{
+  "label": "rep-default-1",
+  "events": 6000,
+  "backlog_at_drain_start": 6000,
+  "ingest_seconds": 17.9,
+  "drain_seconds": 7.9,
+  "delivered": 6000,
+  "dead_lettered": 0,
+  "sink_received": 6000,
+  "duplicate_dispatches": 0,
+  "delivery_throughput_per_sec": 759.5
+}

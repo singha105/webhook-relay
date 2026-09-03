@@ -1,0 +1,37 @@
+# The payload set for experiment 3, kept out of the Job manifest so the shell
+# is not buried in YAML escaping.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: poison-message-script
+  namespace: chaos-testing
+data:
+  poison.sh: |
+    #!/bin/sh
+    set -eu
+
+    EP=$(curl -sS -X POST "$API/v1/endpoints" \
+      -H 'Content-Type: application/json' \
+      -d "{\"url\":\"$SINK\",\"description\":\"poison\"}" \
+      | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    echo "endpoint $EP"
+
+    # Each probes a different assumption about what the pipeline might choke on.
+    post() {
+      code=$(curl -sS -o /tmp/out -w '%{http_code}' -X POST "$API/v1/events" \
+        -H 'Content-Type: application/json' \
+        -d "{\"endpoint_id\":\"$EP\",\"event_type\":\"poison\",\"payload\":$1}")
+      echo "  $2 -> HTTP $code"
+    }
+
+    post '{"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":{"i":1}}}}}}}}}' "deeply nested"
+    post '{"n":1e308}'                                            "float overflow"
+    post '{"n":1e-320}'                                           "denormal"
+    post '{"a":[[[[[[[[[[1]]]]]]]]]]}'                            "nested arrays"
+    post '{"empty":{}}'                                           "empty object"
+    post '[]'                                                     "top-level array"
+    post '"just a string"'                                        "top-level scalar"
+    post 'null'                                                   "top-level null"
+    post '{"dup":1,"dup":2}'                                      "duplicate keys"
+
+    echo "posted. now confirm workers are still delivering."

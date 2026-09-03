@@ -1,0 +1,12 @@
+{
+  "label": "sweep-10a",
+  "events": 8000,
+  "backlog_at_drain_start": 8000,
+  "ingest_seconds": 23.5,
+  "drain_seconds": 15.1,
+  "delivered": 8000,
+  "dead_lettered": 0,
+  "sink_received": 8000,
+  "duplicate_dispatches": 0,
+  "delivery_throughput_per_sec": 529.8
+}

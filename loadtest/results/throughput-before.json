@@ -1,0 +1,12 @@
+{
+  "label": "before",
+  "events": 5000,
+  "backlog_at_drain_start": 5000,
+  "ingest_seconds": 15.2,
+  "drain_seconds": 10.8,
+  "delivered": 5000,
+  "dead_lettered": 0,
+  "sink_received": 5000,
+  "duplicate_dispatches": 0,
+  "delivery_throughput_per_sec": 463.0
+}

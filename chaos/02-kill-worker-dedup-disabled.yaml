@@ -1,0 +1,38 @@
+# Experiment 2 - the same kill, with delivery-side idempotency DISABLED.
+#
+# This is the postmortem. It exists to prove the dedup guard is load-bearing
+# rather than decorative.
+#
+# SETUP - the flag is a Helm value, not part of this manifest:
+#
+#   helm upgrade webhook-relay deploy/charts/webhook-relay \
+#     --set config.delivery.dedupEnabled=false --reuse-values
+#
+# PREDICTION
+# Duplicates appear. The killed worker sends an HTTP request, dies before XACK,
+# and after the stale timeout another worker reclaims the entry and sends the
+# SAME attempt again. With the SETNX guard off, nothing notices that attempt N
+# was already dispatched, so the sink records the same (event_id, attempt) pair
+# twice.
+#
+# Re-enabling the guard and repeating should give zero duplicates.
+#
+# WHAT WOULD FALSIFY IT
+# Zero duplicates with the guard off. That would mean either the kill is not
+# landing between send and ack, or something else is already deduplicating - in
+# which case the guard is not doing what its comments claim.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: kill-worker-dedup-disabled
+  namespace: chaos-testing
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - webhook-relay
+    labelSelectors:
+      app.kubernetes.io/name: webhook-relay
+      app.kubernetes.io/component: worker
+  gracePeriod: 0

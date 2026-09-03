@@ -1,0 +1,47 @@
+# Experiment 8 - network partition between the workers and Valkey.
+#
+# Distinct from experiment 5: there, Valkey DIES and comes back empty. Here it
+# stays alive and keeps its state, but the workers cannot reach it. That is the
+# split-brain-shaped case.
+#
+# PREDICTION
+# Workers cannot claim, so delivery stops. The interesting behaviour is what
+# the fail-open paths do: the rate limiter and the circuit breaker both fail
+# OPEN by design, so if a delivery were somehow in flight it would proceed
+# unthrottled and unguarded. In practice nothing is in flight, because Claim
+# itself fails first - so fail-open never gets exercised and the system simply
+# idles.
+#
+# Meanwhile the relay - which talks to Postgres, not Valkey - keeps claiming
+# events and marking them 'delivering', then FAILS to enqueue them. It should
+# call ReleaseClaim and put them straight back, rather than leaving them to
+# wait out a 5m lease.
+#
+# When the partition heals, everything should resume with no intervention.
+#
+# WHAT WOULD FALSIFY IT
+# Events accumulating in 'delivering' during the partition (ReleaseClaim not
+# working), or workers not recovering when the partition lifts.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: partition-worker-valkey
+  namespace: chaos-testing
+spec:
+  action: partition
+  mode: all
+  selector:
+    namespaces:
+      - webhook-relay
+    labelSelectors:
+      app.kubernetes.io/name: webhook-relay
+      app.kubernetes.io/component: worker
+  direction: both
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - webhook-relay
+      labelSelectors:
+        app.kubernetes.io/name: valkey
+  duration: "2m"

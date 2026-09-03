@@ -1,0 +1,50 @@
+# Experiment 7 - scale workers to zero for five minutes, then back.
+#
+# Expressed as a Chaos Mesh Schedule rather than a kubectl scale, so it is
+# reproducible and self-reverting. pod-kill on ALL workers every 30s for 5
+# minutes is equivalent in effect - nothing stays up long enough to consume -
+# and unlike `kubectl scale` it does not fight ArgoCD's selfHeal, which would
+# restore the replica count within 30 seconds and end the experiment early.
+#
+# That interaction is itself worth knowing: on a GitOps-managed cluster you
+# CANNOT simply scale a Deployment to zero for five minutes. ArgoCD undoes it.
+#
+# PREDICTION
+# Ingest continues unaffected - the API does not depend on workers. The backlog
+# grows at the ingest rate, so at 200 events/sec expect roughly 60,000 events
+# queued after 5 minutes. Oldest-message-age climbs linearly and
+# WebhookBacklogAgeOverSLO fires after ~30s, then WebhookBacklogAgeCritical
+# after ~5m.
+#
+# The API's readiness probe includes a backlog check with a 2m threshold, so
+# the API should go NOT READY and shed ingest - which is intended behaviour,
+# but means the backlog stops growing because the load generator starts getting
+# connection errors. That interaction was not designed deliberately and is
+# worth confirming.
+#
+# On recovery, drain rate is bounded by the endpoint rate limit (1000/s
+# maximum), so 60,000 events need at least 60 seconds to clear.
+#
+# WHAT WOULD FALSIFY IT
+# Events lost rather than queued, or the backlog failing to drain when workers
+# return.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: workers-down-five-minutes
+  namespace: chaos-testing
+spec:
+  schedule: "@every 30s"
+  historyLimit: 12
+  concurrencyPolicy: Forbid
+  type: PodChaos
+  podChaos:
+    action: pod-kill
+    mode: all
+    selector:
+      namespaces:
+        - webhook-relay
+      labelSelectors:
+        app.kubernetes.io/name: webhook-relay
+        app.kubernetes.io/component: worker
+    gracePeriod: 0

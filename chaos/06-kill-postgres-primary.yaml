@@ -1,0 +1,42 @@
+# Experiment 6 - kill the primary Postgres pod and force a failover.
+#
+# Requires postgres_instances >= 3. With one instance there is nothing to fail
+# over TO, and this experiment measures nothing.
+#
+# PREDICTION
+# CloudNativePG notices the primary is gone and promotes a standby. The
+# application connects to the -rw Service, which the operator repoints at the
+# new primary, so no config change is needed. Expected recovery in the tens of
+# seconds.
+#
+# The interesting question is the pgx pool. Every pooled connection to the old
+# primary is now dead. pgxpool does NOT health-check idle connections
+# proactively - it discovers a broken connection when it hands it out and the
+# query fails. So the prediction is: a burst of errors as the pool discards
+# dead connections one at a time, then self-recovery WITHOUT a restart, because
+# pgxpool creates replacements on demand.
+#
+# Ingest during the window returns 500 and the client retries. Events already
+# stored are untouched.
+#
+# WHAT WOULD FALSIFY IT
+# The pool hanging rather than erroring (which would mean requests pile up
+# behind a dead connection until the request timeout), or requiring a pod
+# restart to recover.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: kill-postgres-primary
+  namespace: chaos-testing
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - webhook-relay
+    labelSelectors:
+      cnpg.io/cluster: webhook-relay-db
+      # Only the primary. Killing a replica proves nothing - CloudNativePG just
+      # restarts it and streaming resumes.
+      cnpg.io/instanceRole: primary
+  gracePeriod: 0

@@ -431,3 +431,123 @@ func TestQueueRecoversFromALostConsumerGroup(t *testing.T) {
 	}
 	_ = q.Ack(ctx, got[0].MessageID)
 }
+
+// TestEnqueueBatch covers the pipelined producer path the relay uses.
+//
+// The batching optimisation is only safe if it preserves two properties the
+// serial version had: every event arrives exactly once, and each carries its
+// OWN trace context rather than sharing one. Both are asserted here.
+func TestEnqueueBatch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("an empty batch is a no-op", func(t *testing.T) {
+		q := test.NewQueue(t)
+		n, err := q.EnqueueBatch(ctx, nil)
+		if err != nil {
+			t.Fatalf("EnqueueBatch(nil) = %v", err)
+		}
+		if n != 0 {
+			t.Errorf("enqueued %d, want 0", n)
+		}
+	})
+
+	t.Run("every event in the batch arrives exactly once", func(t *testing.T) {
+		q := test.NewQueue(t)
+		const count = 50
+		items := make([]queue.EnqueueItem, count)
+		want := make(map[uuid.UUID]int, count)
+		for i := range items {
+			id := uuid.New()
+			items[i] = queue.EnqueueItem{EventID: id, Ctx: ctx}
+			want[id] = 0
+		}
+
+		n, err := q.EnqueueBatch(ctx, items)
+		if err != nil {
+			t.Fatalf("EnqueueBatch() = %v", err)
+		}
+		if n != count {
+			t.Fatalf("enqueued %d, want %d", n, count)
+		}
+
+		// Claim in a loop: one Claim is bounded by count, not by what is there.
+		got := 0
+		for got < count {
+			msgs, err := q.Claim(ctx, "batch-consumer", count)
+			if errors.Is(err, queue.ErrEmpty) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Claim() = %v", err)
+			}
+			for _, m := range msgs {
+				if _, ok := want[m.EventID]; !ok {
+					t.Errorf("claimed %s, which was never enqueued", m.EventID)
+					continue
+				}
+				want[m.EventID]++
+				got++
+			}
+		}
+		if got != count {
+			t.Errorf("claimed %d events, want %d", got, count)
+		}
+		for id, seen := range want {
+			if seen != 1 {
+				t.Errorf("event %s was delivered %d times, want exactly 1", id, seen)
+			}
+		}
+	})
+
+	t.Run("each item keeps its own trace context", func(t *testing.T) {
+		q := test.NewQueue(t)
+		// Batching must not collapse many ingests into one trace. Give two
+		// items genuinely different spans and assert they stay different.
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()))
+		defer func() { _ = tp.Shutdown(ctx) }()
+		otel.SetTextMapPropagator(propagation.TraceContext{})
+		tracer := tp.Tracer("test")
+
+		ctxA, spanA := tracer.Start(ctx, "ingest-a")
+		ctxB, spanB := tracer.Start(ctx, "ingest-b")
+		traceA := spanA.SpanContext().TraceID()
+		traceB := spanB.SpanContext().TraceID()
+		spanA.End()
+		spanB.End()
+		if traceA == traceB {
+			t.Fatal("test setup produced identical trace ids")
+		}
+
+		idA, idB := uuid.New(), uuid.New()
+		if _, err := q.EnqueueBatch(ctx, []queue.EnqueueItem{
+			{EventID: idA, Ctx: ctxA},
+			{EventID: idB, Ctx: ctxB},
+		}); err != nil {
+			t.Fatalf("EnqueueBatch() = %v", err)
+		}
+
+		msgs, err := q.Claim(ctx, "trace-consumer", 10)
+		if err != nil {
+			t.Fatalf("Claim() = %v", err)
+		}
+		if len(msgs) != 2 {
+			t.Fatalf("claimed %d messages, want 2", len(msgs))
+		}
+
+		seen := map[uuid.UUID]trace.TraceID{}
+		for _, m := range msgs {
+			sc := trace.SpanContextFromContext(telemetry.ExtractContext(ctx, m.TraceFields))
+			if !sc.IsValid() {
+				t.Fatalf("event %s carried no valid trace context", m.EventID)
+			}
+			seen[m.EventID] = sc.TraceID()
+		}
+		if seen[idA] != traceA {
+			t.Errorf("event A trace = %s, want %s", seen[idA], traceA)
+		}
+		if seen[idB] != traceB {
+			t.Errorf("event B trace = %s, want %s", seen[idB], traceB)
+		}
+	})
+}

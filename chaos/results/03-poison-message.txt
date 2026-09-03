@@ -1,0 +1,22 @@
+  endpoint 0b97ff58-9767-493c-af1b-131a0852525a
+  probing payloads the delivery path might choke on:
+  deeply nested object         -> HTTP 202
+  float at max double          -> HTTP 202
+  denormal float               -> HTTP 202
+  deeply nested arrays         -> HTTP 202
+  empty object                 -> HTTP 202
+  top-level array              -> HTTP 202
+  top-level scalar             -> HTTP 202
+  top-level null               -> HTTP 202
+  duplicate keys               -> HTTP 202
+  3KB string                   -> HTTP 202
+  malformed JSON               -> HTTP 400
+
+  waiting for the pipeline to settle...
+  event states:
+    delivered: 10
+  worker restarts since start: 0
+  worker state: running
+
+  A wedged worker would show as a nonzero restart count, or events stuck
+  in a non-terminal state with the worker still running.

@@ -1,0 +1,43 @@
+# Experiment 3 - a poison message.
+#
+# Not a Chaos Mesh fault: the "chaos" IS the payload, so this is a Job that
+# posts a series of them. Committed here because the question belongs with the
+# others.
+#
+# PREDICTION
+# No single message can wedge a worker. The worker never PARSES the payload -
+# it is stored as JSONB by the API and forwarded to the receiver as opaque
+# bytes - so there is no user-controlled code path in the delivery loop that
+# can panic on content. The API validates JSON at ingest and rejects malformed
+# bodies with a 400, so a bad payload should never reach a worker at all.
+#
+# WHAT WOULD FALSIFY IT
+# A worker crash-looping on one event, or one event blocking everything behind
+# it (head-of-line blocking).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: poison-message
+  namespace: chaos-testing
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: poison
+          image: curlimages/curl:8.11.1
+          env:
+            - name: API
+              value: http://webhook-relay-api.webhook-relay.svc.cluster.local
+            - name: SINK
+              value: http://sink.webhook-relay.svc.cluster.local:9090/hook
+          command: ["/bin/sh", "/scripts/poison.sh"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: poison-message-script
+            defaultMode: 0755
