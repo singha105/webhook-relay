@@ -255,7 +255,11 @@ jobs:
       - name: Trivy
         uses: aquasecurity/trivy-action@v0.33.1
         with:
-          image-ref: webhook-relay:ci-scan
+          # scan-ref, not image-ref: the latter was removed in v0.30 and is
+          # now silently ignored, which made the action default to scanning
+          # the working directory as an image and fail with no useful message.
+          scan-type: image
+          scan-ref: webhook-relay:ci-scan
           format: table
           exit-code: "1"
           ignore-unfixed: true
