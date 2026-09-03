@@ -33,30 +33,38 @@
 # cluster can decrypt the existing ciphertext. Losing it means re-sealing every
 # secret, which is survivable here and career-limiting in production.
 
-resource "helm_release" "sealed_secrets" {
-  name       = "sealed-secrets"
-  repository = "https://bitnami-labs.github.io/sealed-secrets"
-  chart      = "sealed-secrets"
-  version    = var.chart_versions.sealed_secrets
-  namespace  = "kube-system"
+# The Helm repository no longer resolves — Bitnami's 2025 licensing change took
+# https://bitnami-labs.github.io/sealed-secrets with it (404). The upstream
+# project still publishes a plain manifest per release, which is a more stable
+# artifact anyway: it is a single URL pinned to a tag, with no index to go
+# missing.
+data "http" "sealed_secrets_manifest" {
+  url = "https://github.com/bitnami-labs/sealed-secrets/releases/download/v${var.sealed_secrets_version}/controller.yaml"
 
-  atomic          = true
-  cleanup_on_fail = true
-  timeout         = 600
+  lifecycle {
+    postcondition {
+      condition     = self.status_code == 200
+      error_message = "Could not download the Sealed Secrets manifest (HTTP ${self.status_code})."
+    }
+  }
+}
 
-  values = [yamlencode({
-    fullnameOverride = "sealed-secrets-controller"
-    resources = {
-      requests = { cpu = "25m", memory = "64Mi" }
-      limits   = { memory = "128Mi" }
-    }
-    metrics = {
-      serviceMonitor = {
-        enabled   = true
-        namespace = kubernetes_namespace.this["observability"].metadata[0].name
-      }
-    }
-  })]
+# The manifest is multi-document; split it so each object is a separate
+# resource Terraform can track and destroy individually.
+data "kubectl_file_documents" "sealed_secrets" {
+  content = data.http.sealed_secrets_manifest.response_body
+}
+
+resource "kubectl_manifest" "sealed_secrets" {
+  for_each = data.kubectl_file_documents.sealed_secrets.manifests
+
+  yaml_body = each.value
+
+  # CRDs must exist before the CustomResource-consuming objects that follow.
+  # server_side_apply avoids the "metadata.annotations: Too long" failure that
+  # client-side apply hits on large CRDs.
+  server_side_apply = true
+  force_conflicts   = true
 
   depends_on = [kubernetes_namespace.this]
 }

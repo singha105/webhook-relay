@@ -33,12 +33,22 @@ resource "helm_release" "ingress_nginx" {
         type = "ClusterIP"
       }
 
-      # Only schedule on agents. The server node runs the control plane, and an
-      # ingress controller competing with etcd for memory on a laptop is how
-      # you get an unresponsive cluster.
-      nodeSelector = {
-        "node-role.kubernetes.io/control-plane" = null
-      }
+      # Runs on every node, which is what a DaemonSet with hostPort is for:
+      # k3d's loadbalancer forwards the published port to all nodes, so an
+      # ingress pod has to exist on each of them.
+      #
+      # An earlier version tried to exclude the control-plane node with
+      # nodeSelector = { "node-role.kubernetes.io/control-plane" = null }.
+      # That does NOT mean "where this label is absent" — it renders as
+      # `label: ""` and requires the label to EQUAL the empty string. The
+      # server node has "true" and the agent has it absent, so it matched
+      # nothing: the DaemonSet reported DESIRED 0 and the ingress silently did
+      # not exist, while the Helm release still showed "deployed".
+      #
+      # Expressing "where this label is absent" needs nodeAffinity with a
+      # DoesNotExist operator, not a nodeSelector. It is not worth it here —
+      # the controller is ~128Mi and halving ingress capacity on a two-node
+      # cluster costs more than it saves.
 
       resources = {
         requests = { cpu = "50m", memory = "128Mi" }

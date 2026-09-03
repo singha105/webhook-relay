@@ -162,31 +162,28 @@ resource "helm_release" "kube_prometheus_stack" {
         }] : []
       )
 
-      # Point the Prometheus datasource at Tempo for exemplars, which is what
-      # makes a latency spike one click from its trace.
-      datasources = {
-        "datasources.yaml" = {
-          apiVersion = 1
-          datasources = [{
-            name      = "Prometheus"
-            type      = "prometheus"
-            uid       = "prometheus"
-            url       = "http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090"
-            access    = "proxy"
-            isDefault = true
-            jsonData = {
-              timeInterval = "15s"
-              exemplarTraceIdDestinations = local.effective.enable_tempo ? [{
-                name          = "trace_id"
-                datasourceUid = "tempo"
-              }] : []
-            }
-          }]
-        }
-      }
-
-      # The Day 3 dashboard, unchanged, loaded from a ConfigMap.
+      # Exemplars are configured through the chart's OWN Prometheus datasource,
+      # via the sidecar setting, rather than by declaring a second datasource.
+      #
+      # An earlier version defined a full `datasources` block with
+      # isDefault: true. kube-prometheus-stack already creates a default
+      # Prometheus datasource, so that produced TWO defaults — and Grafana
+      # refuses to start with "Only one datasource per organization can be
+      # marked as default". It presents as a CrashLoopBackOff with the real
+      # reason buried in the provisioning log.
       sidecar = {
+        datasources = {
+          enabled                  = true
+          defaultDatasourceEnabled = true
+          # This is what turns an exemplar on the latency panel into a link to
+          # the trace that produced it.
+          exemplarTraceIdDestinations = local.effective.enable_tempo ? {
+            datasourceUid    = "tempo"
+            traceIdLabelName = "trace_id"
+          } : null
+        }
+
+        # The Day 3 dashboard, unchanged, loaded from a ConfigMap.
         dashboards = {
           enabled          = true
           label            = "grafana_dashboard"

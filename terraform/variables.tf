@@ -158,13 +158,13 @@ variable "chart_versions" {
   type        = map(string)
   default = {
     cloudnative_pg  = "0.23.0"
-    valkey          = "2.4.4"
     kube_prometheus = "68.3.0"
     tempo           = "1.18.2"
     loki            = "6.24.0"
     ingress_nginx   = "4.12.0"
     argo_cd         = "7.7.16"
     chaos_mesh      = "2.7.0"
+    sealed_secrets  = "2.16.2"
   }
 }
 
@@ -182,4 +182,10 @@ variable "gitops_target_revision" {
   description = "Branch or tag ArgoCD tracks."
   type        = string
   default     = "main"
+}
+
+variable "sealed_secrets_version" {
+  description = "Sealed Secrets release to install, without the leading v."
+  type        = string
+  default     = "0.27.3"
 }
