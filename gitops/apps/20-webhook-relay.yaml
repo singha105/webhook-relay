@@ -14,7 +14,7 @@ spec:
 
   source:
     repoURL: https://github.com/singha105/webhook-relay.git
-    targetRevision: main
+    targetRevision: day-4/kubernetes-and-gitops
     path: deploy/charts/webhook-relay
     helm:
       releaseName: webhook-relay
