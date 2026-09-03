@@ -90,8 +90,13 @@ resource "kubernetes_deployment" "valkey" {
 
       spec {
         container {
-          name  = "valkey"
-          image = "valkey/valkey:8-alpine"
+          name = "valkey"
+          # Pinned by DIGEST, not by tag. "8-alpine" is mutable — the image it
+          # resolves to today is not the one it resolves to next month, which
+          # makes a cluster rebuild non-reproducible and a rollback
+          # meaningless. This is the same argument the Helm chart makes for
+          # refusing a mutable application tag.
+          image = "valkey/valkey@sha256:b21fd94099dcd4bc6b2b9230daef69b6558b887ad4a2a1afe56ff6e745a88cdb"
           args  = ["/etc/valkey/valkey.conf"]
 
           port {
@@ -134,6 +139,9 @@ resource "kubernetes_deployment" "valkey" {
             allow_privilege_escalation = false
             run_as_non_root            = true
             run_as_user                = 999
+            # Valkey writes only to /data, which is an emptyDir mounted below.
+            # Persistence is off, so nothing else on disk is ever written.
+            read_only_root_filesystem = true
             capabilities { drop = ["ALL"] }
           }
         }

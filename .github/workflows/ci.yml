@@ -166,7 +166,16 @@ jobs:
           #   CKV_K8S_21  default namespace   — we create explicit namespaces
           #   CKV_TF_1    module commit hash  — no external modules used
           #   CKV_TF_2    module version tag  — same
-          skip_check: CKV_K8S_21,CKV_TF_1,CKV_TF_2
+          #   CKV_K8S_11  CPU limits          — deliberate. A CPU limit
+          #               throttles rather than kills, and CFS throttling on a
+          #               single-threaded event loop (Valkey) or a
+          #               latency-sensitive HTTP path turns a busy moment into
+          #               tail latency that looks like a network fault. Requests
+          #               are set; the scheduler packs against those.
+          #   CKV_K8S_15  imagePullPolicy Always — moot once the image is
+          #               pinned by digest, and Always costs a registry round
+          #               trip on every pod start.
+          skip_check: CKV_K8S_21,CKV_TF_1,CKV_TF_2,CKV_K8S_11,CKV_K8S_15
 
       - uses: azure/setup-helm@v4
         with:
@@ -244,7 +253,7 @@ jobs:
         run: docker build -t webhook-relay:ci-scan --build-arg TARGET=api .
 
       - name: Trivy
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           image-ref: webhook-relay:ci-scan
           format: table
@@ -256,7 +265,7 @@ jobs:
           # blanket ignores.
 
       - name: Trivy config scan on the Kubernetes manifests
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           scan-type: config
           scan-ref: deploy
