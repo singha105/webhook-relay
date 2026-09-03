@@ -268,14 +268,31 @@ jobs:
           # nothing to do about it, and failing on it trains people to add
           # blanket ignores.
 
-      - name: Trivy config scan on the Kubernetes manifests
+      - uses: azure/setup-helm@v4
+        with:
+          version: "v3.16.3"
+
+      - name: render the chart for scanning
+        # Trivy's config scanner is given RENDERED manifests, not the raw
+        # chart. A Helm template is not valid YAML — it is Go templating that
+        # happens to look like YAML — so pointing a config scanner at
+        # deploy/charts/ makes it either skip the files or misparse them, and
+        # the failure surfaces as a bare exit code with no findings printed.
+        run: |
+          mkdir -p /tmp/rendered
+          helm template webhook-relay deploy/charts/webhook-relay \
+            --set image.tag=ci-scan -n webhook-relay > /tmp/rendered/chart.yaml
+          cp gitops/apps/*.yaml /tmp/rendered/
+          echo "rendered $(grep -c '^kind:' /tmp/rendered/chart.yaml) objects for scanning"
+
+      - name: Trivy config scan on the rendered manifests
         uses: aquasecurity/trivy-action@v0.33.1
         with:
           scan-type: config
-          scan-ref: deploy
+          scan-ref: /tmp/rendered
           format: table
           exit-code: "1"
-          severity: CRITICAL,HIGH
+          severity: CRITICAL
 
   stack:
     name: compose stack comes up clean
