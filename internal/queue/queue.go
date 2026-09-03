@@ -90,6 +90,14 @@ type ClaimedMessage struct {
 	TraceFields map[string]string
 }
 
+// EnqueueItem is one event to enqueue, with the context carrying the trace
+// that created it. Each item gets its own trace context injected, so batching
+// does not collapse many traces into one.
+type EnqueueItem struct {
+	EventID uuid.UUID
+	Ctx     context.Context
+}
+
 // Queue is the contract between the outbox relay and the delivery workers.
 //
 // Implementations must be at-least-once: an entry that is claimed but never
@@ -102,6 +110,16 @@ type Queue interface {
 	// Implementations inject the caller's trace context into the message, so
 	// the delivery that eventually happens is part of the same trace.
 	Enqueue(ctx context.Context, eventID uuid.UUID) error
+
+	// EnqueueBatch makes many events available in as few round trips as
+	// possible. It returns the number successfully enqueued, which is a prefix
+	// of items: on a partial failure the caller must release the claims on the
+	// remainder itself.
+	//
+	// This exists because the relay is the sole producer for the whole system.
+	// Enqueueing one event per round trip made the relay — not the workers, not
+	// Postgres — the ceiling on end-to-end throughput.
+	EnqueueBatch(ctx context.Context, items []EnqueueItem) (int, error)
 
 	// Claim takes up to count entries for the named consumer. It returns
 	// ErrEmpty rather than blocking indefinitely, so the caller keeps control

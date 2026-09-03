@@ -151,47 +151,51 @@ func (r *Relay) relayOnce(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	enqueued := 0
+	// Build the batch first, then enqueue it in one round trip.
+	//
+	// The trace context is rehydrated per event: the relay has no in-process
+	// link to the request that created the row — it is a background poller
+	// reading rows written minutes ago — so this is the only way a delivery
+	// ends up in the same trace as its ingest. Batching must not collapse
+	// those into a single trace, hence one context per item.
+	//
+	// A span here would be noise (the relay is a poll loop, not a unit of
+	// work), so the contexts are only carried for injection.
+	items := make([]queue.EnqueueItem, 0, len(due))
 	for _, ev := range due {
-		id := ev.ID
+		items = append(items, queue.EnqueueItem{
+			EventID: ev.ID,
+			Ctx:     telemetry.ExtractContext(ctx, ev.TraceContext),
+		})
+	}
 
-		// Rehydrate the trace context that was captured at ingest. The relay
-		// has no in-process link to that request — it is a background poller
-		// reading rows written minutes ago — so this is the only way the
-		// delivery ends up in the same trace as the ingest that created it.
-		//
-		// A span here would be noise (the relay is a poll loop, not a unit of
-		// work), so the context is passed through for Enqueue to inject into
-		// the message and nothing more.
-		enqueueCtx := telemetry.ExtractContext(ctx, ev.TraceContext)
-
-		if err := r.queue.Enqueue(enqueueCtx, id); err != nil {
-			if ctx.Err() != nil {
-				// Shutting down. The remaining events keep their lease and
-				// will be requeued when it expires; nothing is lost. The
-				// enqueue error is a symptom of cancellation, not a fault to
-				// report.
-				//nolint:nilerr // deliberate: a cancelled shutdown is not an error
-				return enqueued, nil
-			}
-			// The enqueue failed, so this event has a lease and no message.
-			// Release it immediately rather than making it wait out the full
-			// lease — Valkey being briefly unavailable is the common case here.
-			r.logger.Error("enqueue failed, releasing claim",
-				slog.String("event_id", id.String()),
-				slog.Any("error", err),
-			)
-			if relErr := r.store.ReleaseClaim(ctx, id); relErr != nil {
-				// Now the event will wait out its lease. Still correct, just
-				// slower, so this is a warning rather than an error.
-				r.logger.Warn("could not release claim; the lease will expire instead",
-					slog.String("event_id", id.String()),
-					slog.Any("error", relErr),
-				)
-			}
-			continue
+	enqueued, err := r.queue.EnqueueBatch(ctx, items)
+	if err != nil {
+		if ctx.Err() != nil {
+			// Shutting down. The events that did not make it keep their lease
+			// and are requeued when it expires; nothing is lost.
+			//nolint:nilerr // deliberate: a cancelled shutdown is not an error
+			return enqueued, nil
 		}
-		enqueued++
+		r.logger.Error("enqueue batch failed, releasing the unenqueued claims",
+			slog.Int("enqueued", enqueued),
+			slog.Int("claimed", len(due)),
+			slog.Any("error", err),
+		)
+	}
+
+	// Every event past the successful prefix holds a lease and has no message.
+	// Release those immediately rather than making them wait out the full
+	// lease — Valkey being briefly unavailable is the common case here.
+	for _, ev := range due[enqueued:] {
+		if relErr := r.store.ReleaseClaim(ctx, ev.ID); relErr != nil {
+			// Now the event waits out its lease. Still correct, just slower,
+			// so this is a warning rather than an error.
+			r.logger.Warn("could not release claim; the lease will expire instead",
+				slog.String("event_id", ev.ID.String()),
+				slog.Any("error", relErr),
+			)
+		}
 	}
 
 	r.logger.Debug("relayed a batch",

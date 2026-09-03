@@ -179,6 +179,59 @@ func (q *ValkeyQueue) Enqueue(ctx context.Context, eventID uuid.UUID) error {
 	return nil
 }
 
+// EnqueueBatch pipelines the XADDs so a batch costs one network round trip
+// instead of len(items).
+//
+// Measured on the Day 5 harness: the serial version pinned end-to-end delivery
+// at ~770 events/sec regardless of worker concurrency or pool size, because
+// every event cost a full round trip from a single goroutine.
+//
+// Pipelining is NOT a transaction. Commands are sent together and each is
+// applied independently, so a partial failure is possible — which is why this
+// returns a count rather than just an error. The count is the number of
+// leading commands that succeeded; the caller releases the rest.
+func (q *ValkeyQueue) EnqueueBatch(ctx context.Context, items []EnqueueItem) (int, error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+
+	pipe := q.client.Pipeline()
+	cmds := make([]*redis.StringCmd, len(items))
+	for i, it := range items {
+		values := map[string]any{fieldEventID: it.EventID.String()}
+		// Inject each event's own trace context, not the relay loop's.
+		// Deliberately the item's own context, not a child of ctx: it exists
+		// only to carry the trace that created this event, and each item
+		// carries a different one. ctx is the deadline for the pipeline.
+		//nolint:contextcheck // per-item trace context is the point of the batch
+		injectCtx := it.Ctx
+		if injectCtx == nil {
+			injectCtx = ctx
+		}
+		for k, v := range telemetry.InjectContext(injectCtx) {
+			values[traceFieldPrefix+k] = v
+		}
+		args := &redis.XAddArgs{Stream: q.stream, Values: values}
+		if q.maxLen > 0 {
+			args.MaxLen = q.maxLen
+			args.Approx = true
+		}
+		cmds[i] = pipe.XAdd(ctx, args)
+	}
+
+	// Exec returns the first error, but every command still carries its own.
+	// Walk them so a partial success is reported accurately.
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		for i, c := range cmds {
+			if cerr := c.Err(); cerr != nil && !errors.Is(cerr, redis.Nil) {
+				return i, fmt.Errorf("enqueue batch at %d (event %s): %w", i, items[i].EventID, cerr)
+			}
+		}
+		return 0, fmt.Errorf("enqueue batch: %w", err)
+	}
+	return len(items), nil
+}
+
 // Claim reads new entries for this consumer.
 //
 // Block is 0 (return immediately) rather than a blocking read. A blocking
