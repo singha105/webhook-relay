@@ -10,8 +10,8 @@
 # to Git — so no GitHub Actions runner ever holds a kubeconfig. See the README
 # section "Why pull-based delivery is more secure".
 image:
-  repository: webhook-relay-registry:5000/webhook-relay
+  repository: ghcr.io/singha105/webhook-relay
   # Overwritten by CI with sha-<short-sha>. The placeholder is a real tag that
   # will fail to pull rather than a mutable one that would silently deploy
   # something unknown.
-  tag: "dev"
+  tag: "sha-bootstrap"

@@ -580,6 +580,26 @@ deploy/charts/webhook-relay  the application        <- deployed BY ArgoCD, not T
 gitops/                      what ArgoCD watches
 ```
 
+### What this actually looks like
+
+![the cluster after terraform apply](docs/images/cluster.png)
+
+![migrations ran as a Helm hook before any pod started](docs/images/migrate.png)
+
+The schema is at version 4 before a single application pod exists. That is the
+`pre-upgrade` hook doing its job: new code never runs against an old schema.
+
+### Self-healing
+
+`selfHeal: true` means the repository is the desired state, continuously — not
+just at deploy time.
+
+![ArgoCD restoring a deleted Deployment](docs/images/selfheal.png)
+
+Two seconds, and a different UID — genuinely recreated, not an incomplete
+delete. This is also why every "fix it with kubectl" instruction in the
+[runbook](docs/runbook.md) is marked temporary.
+
 ### Why Terraform stops at the cluster boundary
 
 Terraform provisions infrastructure. ArgoCD deploys the application. The
