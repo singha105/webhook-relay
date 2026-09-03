@@ -1,0 +1,12 @@
+{
+  "label": "run",
+  "events": 6000,
+  "backlog_at_drain_start": 6000,
+  "ingest_seconds": 11.0,
+  "drain_seconds": 7.1,
+  "delivered": 6000,
+  "dead_lettered": 0,
+  "sink_received": 6000,
+  "duplicate_dispatches": 0,
+  "delivery_throughput_per_sec": 845.1
+}

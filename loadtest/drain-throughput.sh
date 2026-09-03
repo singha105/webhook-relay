@@ -79,7 +79,11 @@ DEADLINE=$(( $(date +%s) + 900 ))
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   REMAINING=$(PSQL "SELECT count(*) FROM events WHERE status NOT IN ('delivered','dlq');")
   [ "$REMAINING" = "0" ] && break
-  sleep 2
+  # 0.25s, not 2s. At 2s the drain time was quantised to the poll interval:
+  # three repeats of one configuration produced 759.5, 769.2 and 759.5 ev/s,
+  # which is 6000 events over 7.9s or 7.8s — the values were an artefact of
+  # the sampling granularity, far too coarse to resolve a 10-20% difference.
+  sleep 0.25
 done
 DRAIN_END=$(python3 -c 'import time;print(time.time())')
 DRAIN_SECS=$(python3 -c "print(round(${DRAIN_END}-${DRAIN_START},1))")
