@@ -55,3 +55,23 @@ go.work.sum
 
 # Local data volumes
 /deploy/compose/data/
+
+# Terraform
+# *.tfstate is already ignored above; these are the rest of the local-state
+# footprint. The lock file IS intentionally excluded here because this project
+# pins every provider version explicitly in versions.tf and the lock would
+# otherwise pin to one platform's hashes, breaking a Linux CI runner that
+# initialises after a macOS developer committed it. A team with a homogeneous
+# CI platform should commit it.
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfplan
+terraform/crash.log
+terraform/override.tf
+terraform/override.tf.json
+
+# SOPS age private key — the one file that must never be committed.
+age.key
+*.agekey

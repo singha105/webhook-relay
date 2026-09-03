@@ -9,15 +9,15 @@ failure modes — the kind of service Stripe or Svix runs internally.
 
 ---
 
-## Status: Day 3 of 6
+## Status: Day 4 of 6
 
 This repository is being built in public, one day at a time. **Only what is
 described below actually works.** Nothing here is a stub presented as finished.
 
 | | |
 |---|---|
-| ✅ **Working today** | Everything from Days 1–2, plus per-endpoint rate limiting, per-endpoint circuit breaker, distributed tracing across the queue, Prometheus metrics, a provisioned Grafana dashboard, graceful shutdown, and a defined SLO |
-| ⬜ **Not built yet** | Kubernetes, Helm, Terraform, ArgoCD and chaos testing (Day 5); k6 load test and the postmortem (Day 6). |
+| ✅ **Working today** | Everything from Days 1–3, plus a k3d cluster from a committed config, Terraform-provisioned infrastructure, a Helm chart, GitOps delivery with ArgoCD, signed images with SBOMs, NetworkPolicies, alert rules, and an on-call runbook |
+| ⬜ **Not built yet** | Chaos experiments (Day 5); k6 load test and the postmortem (Day 6). |
 
 The roadmap is at the [bottom of this file](#roadmap).
 
@@ -57,6 +57,20 @@ make demo-up && make demo
 
 **Grafana is at [localhost:3000](http://localhost:3000)** with the dashboard
 already loaded — no login, no datasource wiring, no import step.
+
+### On Kubernetes
+
+Docker Compose is the fast path. The real deployment target is a Kubernetes
+cluster, provisioned entirely by code:
+
+```bash
+make cluster-up      # k3d, from deploy/k3d/cluster.yaml
+make bootstrap       # Terraform provisions everything into it
+make endpoints       # prints URLs and generated passwords
+```
+
+`make cluster-up PROFILE=lowmem` uses a 1-agent profile if Docker has under
+~5 GiB. See [Resource requirements](#resource-requirements).
 
 <details>
 <summary><code>make</code> targets</summary>
@@ -554,6 +568,221 @@ wrong.
 
 ---
 
+## Running on Kubernetes
+
+Nothing below is applied by hand. `make bootstrap` runs Terraform, Terraform
+installs ArgoCD, and ArgoCD deploys the application from this repository.
+
+```
+deploy/k3d/cluster.yaml      the cluster            <- committed, not typed flags
+terraform/                   everything in it       <- terraform apply
+deploy/charts/webhook-relay  the application        <- deployed BY ArgoCD, not Terraform
+gitops/                      what ArgoCD watches
+```
+
+### What this actually looks like
+
+![the cluster after terraform apply](docs/images/cluster.png)
+
+![migrations ran as a Helm hook before any pod started](docs/images/migrate.png)
+
+The schema is at version 4 before a single application pod exists. That is the
+`pre-upgrade` hook doing its job: new code never runs against an old schema.
+
+### Self-healing
+
+`selfHeal: true` means the repository is the desired state, continuously — not
+just at deploy time.
+
+![ArgoCD restoring a deleted Deployment](docs/images/selfheal.png)
+
+Two seconds, and a different UID — genuinely recreated, not an incomplete
+delete. This is also why every "fix it with kubectl" instruction in the
+[runbook](docs/runbook.md) is marked temporary.
+
+### Why Terraform stops at the cluster boundary
+
+Terraform provisions infrastructure. ArgoCD deploys the application. The
+obvious alternative — have Terraform install the app's chart too — is what most
+people do, and it is worse in three specific ways:
+
+| | Terraform deploys the app | ArgoCD deploys the app |
+|---|---|---|
+| Drift | Silent until the next apply, possibly weeks | Corrected in ~30s |
+| Deploying a new image | Run Terraform from CI → **CI needs cluster credentials** | Commit a tag → CI needs nothing |
+| Rollback | Revert and re-apply, with no record of what ran when | `argocd app rollback`, or `git revert` |
+
+### Why pull-based delivery is more secure
+
+This is the part worth being able to argue.
+
+The push model — `kubectl apply` or `helm upgrade` from GitHub Actions —
+requires a long-lived cluster credential stored in a third party's secret
+store:
+
+- **Any workflow in the repository can read it**, including one added by a pull
+  request that modifies `.github/workflows`. That is a well-known escalation
+  path.
+- **The API server must accept inbound connections from GitHub's runner
+  ranges**, so it is exposed to the internet rather than reachable only from
+  inside the network.
+- **A compromised runner has immediate, direct cluster access**, with no audit
+  trail beyond logs the attacker can influence.
+
+Pull inverts it. CI can only write to Git. ArgoCD, running *inside* the
+cluster, reads from Git and applies:
+
+- No cluster credential exists outside the cluster.
+- The API server needs no inbound internet access at all.
+- Every deployment is a commit — reviewable, attributable, revertible.
+  `git log gitops/values.yaml` is the deployment history.
+- A compromised runner can at worst commit a bad tag, which shows in the diff
+  and is undone by `git revert`.
+
+### The deployment path, end to end
+
+```
+merge to main
+  → release.yml builds a multi-arch image
+  → pushes to ghcr.io tagged sha-<12-char-sha>   (never :latest)
+  → cosign signs it keylessly via the workflow's OIDC identity
+  → Syft SBOM attached as a signed attestation
+  → CI commits the new tag into gitops/values.yaml
+  → ArgoCD notices the commit and syncs
+  → Helm pre-upgrade hook runs migrations behind an advisory lock
+  → new pods roll out
+```
+
+The image is never tagged `latest`. The chart **fails the render** if you try:
+
+```
+image.tag must be set to an immutable tag (a git SHA). 'latest' is refused:
+it makes rollback impossible and lets two pods claiming one version run
+different code.
+```
+
+### Signing and provenance
+
+Cosign signs with **no key at all**. It exchanges the workflow's OIDC token for
+a short-lived certificate from Fulcio and records the signature in the public
+Rekor transparency log. There is no signing key to leak, and the certificate
+binds the signature to *this workflow in this repository* — something a
+checksum cannot express.
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github.com/singha105/webhook-relay/.github/workflows/release.yml@refs/heads/main$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  ghcr.io/singha105/webhook-relay:sha-<sha>
+```
+
+The SBOM is attached as a signed attestation rather than an uploaded artifact,
+so "what is in this image" is answerable from the image alone — which is what
+matters at the moment a CVE lands and you need to know whether you are
+affected.
+
+### The SIGTERM ordering
+
+Getting this wrong causes duplicate deliveries on every rollout, silently.
+
+When a pod is deleted, **two things happen concurrently and Kubernetes does not
+order them**: the kubelet sends `SIGTERM`, and the endpoints controller removes
+the pod from the Service. The second is eventually consistent.
+
+```
+t=0     pod marked Terminating
+        ├─ endpoint removal begins  (takes ~1-2s to propagate)
+        └─ preStop sleep begins     ← holds the container open meanwhile
+t=5s    preStop returns, SIGTERM delivered
+t=5s    app stops claiming new work, finishes in-flight deliveries
+t=?     app exits
+t=45s   terminationGracePeriodSeconds expires → SIGKILL
+```
+
+Without the preStop delay, a process that exits promptly on `SIGTERM` is still
+being routed to — the client sees connection refused, which on the ingest path
+is a dropped event.
+
+`terminationGracePeriodSeconds` is **computed**, not hand-set:
+`preStopDelay + drainTimeout + 10s`. Hand-setting it is how you get a worker
+SIGKILLed mid-delivery, leaving an unacked queue entry that is redelivered
+later as a duplicate caused purely by a rollout.
+
+The `preStop` uses the **native `sleep` action**, not `exec`. The image is
+distroless — there is no shell and no `/bin/sleep`, so `exec: ["sh","-c","sleep 5"]`
+would fail to start and the kubelet would go straight to `SIGTERM`, silently
+removing the delay.
+
+### Migrations, and the race they avoid
+
+Migrations run as a Helm `pre-upgrade` hook, not an initContainer. An
+initContainer runs once per pod — four replicas means four concurrent migration
+attempts on every rollout.
+
+The failure being prevented: two deploys overlapping (a rollback issued while a
+rollout finishes, or ArgoCD retrying a failed sync) both read
+`schema_migrations`, both see version N, both apply N+1. That is either a loud
+duplicate-object error, or — worse — two `ALTER`s that both succeed and leave a
+schema no migration file describes. golang-migrate takes a Postgres session
+advisory lock, so the second process waits.
+
+### NetworkPolicies
+
+Default-deny, then enumerate. The asymmetry is the interesting part:
+
+| | Postgres | Valkey | Internet |
+|---|---|---|---|
+| **API** | ✅ | ✅ | ❌ **denied** |
+| **Worker** | ✅ | ✅ | ✅ except RFC1918 |
+
+The API never makes an outbound call, so denying it egress means an SSRF in the
+ingest path cannot become an outbound request — even though the API accepts
+customer-supplied URLs at endpoint registration.
+
+The worker *must* reach arbitrary addresses, so an allow-list is impossible.
+What *is* possible is excluding `10/8`, `172.16/12`, `192.168/16` and
+`169.254/16`, so a customer cannot register `http://10.0.0.1/` and use our
+worker to scan the internal network. That closes the SSRF gap the Day 1 README
+listed, at the network layer rather than with URL validation an attacker can
+encode around.
+
+> **Not enforced on this cluster.** k3s ships Flannel, which accepts
+> NetworkPolicy objects and silently ignores them. Real enforcement needs
+> Calico or Cilium. The policies are correct and committed; they are currently
+> documentation.
+
+### Secrets in Git
+
+See **[docs/secrets.md](docs/secrets.md)** for the full argument. The summary:
+
+- **Sealed Secrets** for anything ArgoCD deploys — a `SealedSecret` is a plain
+  manifest, so ArgoCD needs no plugin, no sidecar, and no key.
+- **SOPS + age** for values a human or a CI job needs, which a SealedSecret can
+  never provide (it can only be decrypted by the controller).
+- **Best of all: generate at provision time.** The Postgres and Grafana
+  passwords are generated by Terraform and never enter Git in any form. That is
+  strictly better than encrypting and committing, and it is available whenever
+  the thing creating the cluster can also create the secret.
+
+The trap: the Sealed Secrets private key lives in the cluster. Recreate the
+cluster and every committed `SealedSecret` becomes undecryptable — ArgoCD syncs
+green and no `Secret` ever appears. `make seal-backup` exports it.
+
+### Resource requirements
+
+| Profile | Docker memory | What you get |
+|---|---|---|
+| `full` | **~6 GiB** | 1 server + 2 agents, 3-replica Postgres with real failover, Loki, Chaos Mesh |
+| `lowmem` | ~3.5 GiB | 1 server + 1 agent, single Postgres, no Loki, no Chaos Mesh, 6h metrics retention |
+
+```bash
+make cluster-up PROFILE=lowmem && make bootstrap PROFILE=lowmem
+```
+
+The full profile needs Docker Desktop → Settings → Resources → Memory ≥ 6 GiB.
+
+---
+
 ## Service level objective
 
 > **99% of events are delivered within 30 seconds of ingest, measured over a
@@ -704,6 +933,13 @@ their connection pools before the starting gate opens.
 ## Layout
 
 ```
+deploy/k3d/         cluster definition — committed, not typed flags
+terraform/          cluster infrastructure: CNPG, Valkey, observability, ArgoCD
+deploy/charts/      the Helm chart ArgoCD deploys
+gitops/             app-of-apps; gitops/values.yaml is written by CI
+docs/runbook.md     on-call procedures
+docs/secrets.md     how secrets live in Git without being readable
+
 cmd/api/            HTTP ingest + management API
 cmd/worker/         outbox relay + delivery worker pool
 internal/models/    domain types and validation; no I/O
@@ -730,8 +966,8 @@ test/sink/          controllable webhook receiver for tests and the demo
 | **1** ✅ | Ingest API, schema, idempotency, local stack, CI |
 | **2** ✅ | Outbox relay, Valkey Streams, delivery worker, HMAC signing, full-jitter retries, DLQ, replay |
 | **3** ✅ | Rate limiting, circuit breaker, tracing, metrics, Grafana, graceful shutdown, SLO |
-| **4** | Merged into Day 3 — the observability stack is already running |
-| **5** | k3d + Helm + Terraform + ArgoCD; Chaos Mesh fault injection |
+| **4** ✅ | k3d + Terraform + Helm + ArgoCD, signed images, NetworkPolicies, alerts, runbook |
+| **5** | Chaos Mesh fault injection against all of it |
 | **6** | k6 load test, benchmark numbers, and the postmortem |
 
 `endpoints.consecutive_failures` is already maintained by the worker — reset on
@@ -756,9 +992,18 @@ Stated plainly rather than discovered by a reviewer:
   metrics. Fine for the tens of endpoints this targets, a cardinality problem at
   thousands. The breaker gauge is explicitly bounded at 500 series; the latency
   histogram deliberately omits the label entirely.
-- **Grafana runs with anonymous admin access.** Correct for a local demo where a
-  login stands between `make up` and a working dashboard; not something to
-  deploy.
+- **Grafana runs with anonymous admin access in the Compose stack.** Correct
+  for a local demo where a login stands between `make up` and a working
+  dashboard; not something to deploy. The Kubernetes deployment uses a
+  generated password instead.
+- **NetworkPolicies are written but not enforced**, because k3s ships Flannel.
+  They need Calico or Cilium to do anything.
+- **The HPA's queue-depth metric is disabled by default.** It needs
+  prometheus-adapter, which is not installed; the CPU target still works. An
+  HPA referencing a metric nobody serves is a silently degraded autoscaler,
+  which is why it is off rather than aspirational.
+- **The full profile needs ~6 GiB of Docker memory.** The `lowmem` profile
+  fits in ~3.5 GiB but gives up Postgres failover, Loki, and Chaos Mesh.
 - **Tracing samples at 100%.** Right at this volume and for a demonstration.
   Real traffic needs head or tail sampling.
 - **The breaker can overshoot its threshold.** Ten concurrent goroutines can

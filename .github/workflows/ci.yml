@@ -124,6 +124,187 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # ---------------------------------------------------------------------------
+  # Infrastructure and deployment artifacts
+  #
+  # These are fast, need no cluster, and catch the errors that would otherwise
+  # only surface during an apply against a real cluster — which on a laptop
+  # means a ten-minute round trip per typo.
+  # ---------------------------------------------------------------------------
+  infra:
+    name: infrastructure manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.0"
+          # The wrapper rewrites stdout, which breaks `terraform validate
+          # -json` parsing and makes failures hard to read.
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform -chdir=terraform fmt -check -recursive -diff
+
+      - name: terraform init
+        # -backend=false: validation does not need state, and initialising a
+        # backend would require credentials CI deliberately does not have.
+        run: terraform -chdir=terraform init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform -chdir=terraform validate
+
+      - name: Checkov on the Terraform
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform
+          framework: terraform
+          quiet: true
+          soft_fail: false
+          # Skipped with reasons, not blanket-disabled:
+          #   CKV_K8S_21  default namespace   — we create explicit namespaces
+          #   CKV_TF_1    module commit hash  — no external modules used
+          #   CKV_TF_2    module version tag  — same
+          #   CKV_K8S_11  CPU limits          — deliberate. A CPU limit
+          #               throttles rather than kills, and CFS throttling on a
+          #               single-threaded event loop (Valkey) or a
+          #               latency-sensitive HTTP path turns a busy moment into
+          #               tail latency that looks like a network fault. Requests
+          #               are set; the scheduler packs against those.
+          #   CKV_K8S_15  imagePullPolicy Always — moot once the image is
+          #               pinned by digest, and Always costs a registry round
+          #               trip on every pod start.
+          skip_check: CKV_K8S_21,CKV_TF_1,CKV_TF_2,CKV_K8S_11,CKV_K8S_15
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: "v3.16.3"
+
+      - name: helm lint
+        run: |
+          helm lint deploy/charts/webhook-relay --set image.tag=ci-test
+          helm lint deploy/charts/webhook-relay --set image.tag=ci-test -f deploy/charts/webhook-relay/values-dev.yaml
+
+      - name: chart migrations are in sync with the repository
+        # The chart carries its own copy of the .sql files so that a rollback
+        # deploys the migration set that matches the code. A drift between the
+        # two would mean the chart silently ships the wrong schema.
+        run: |
+          if ! diff -r migrations deploy/charts/webhook-relay/migrations \
+               --exclude=README.md >/dev/null; then
+            echo "deploy/charts/webhook-relay/migrations has drifted from /migrations"
+            diff -r migrations deploy/charts/webhook-relay/migrations --exclude=README.md || true
+            echo "run: make chart-sync"
+            exit 1
+          fi
+          echo "migrations in sync"
+
+      - name: install kubeconform
+        run: |
+          curl -sSL -o /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp
+          sudo mv /tmp/kubeconform /usr/local/bin/
+
+      - name: validate rendered manifests against Kubernetes schemas
+        # helm lint checks the chart; this checks the OUTPUT. A template can be
+        # syntactically valid Helm and still render a Deployment the API server
+        # would reject.
+        run: |
+          for values in "" "-f deploy/charts/webhook-relay/values-dev.yaml"; do
+            helm template webhook-relay deploy/charts/webhook-relay \
+              --set image.tag=ci-test $values -n webhook-relay \
+            | kubeconform -strict -summary \
+                -kubernetes-version 1.31.0 \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          done
+
+      - name: validate the ArgoCD manifests
+        run: |
+          kubeconform -strict -summary \
+            -kubernetes-version 1.31.0 \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            gitops/apps/*.yaml
+
+      - name: the chart must refuse a mutable tag
+        # A guard on a guard. If someone "fixes" the image helper by removing
+        # this check, the chart would start accepting :latest and rollback
+        # would quietly stop working.
+        run: |
+          if helm template webhook-relay deploy/charts/webhook-relay \
+               --set image.tag=latest -n webhook-relay >/dev/null 2>&1; then
+            echo "the chart accepted image.tag=latest; the immutability guard is gone"
+            exit 1
+          fi
+          echo "mutable tag correctly refused"
+
+  image:
+    name: image scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build the image
+        # Loaded into the local daemon rather than pushed: a PR from a fork
+        # must not be able to publish, and scanning does not need a registry.
+        run: docker build -t webhook-relay:ci-scan --build-arg TARGET=api .
+
+      # Trivy is run directly from its official image rather than through
+      # aquasecurity/trivy-action.
+      #
+      # The action wraps the scan in a setup layer that git-clones the entire
+      # aquasecurity/trivy repository for its policy bundle, and when any part
+      # of that fails it surfaces as a bare "exit code 1" with no findings
+      # printed — which is the worst possible CI failure to debug, and cost
+      # several runs here to rule out. The same scan runs clean locally with
+      # identical flags.
+      #
+      # Invoking the pinned image directly means: fewer moving parts, the
+      # actual Trivy output in the log, and a version we control.
+      - name: Trivy vulnerability scan
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${HOME}/.cache/trivy:/root/.cache/trivy" \
+            aquasec/trivy:0.58.1 image \
+              --scanners vuln \
+              --severity CRITICAL,HIGH \
+              --ignore-unfixed \
+              --exit-code 1 \
+              --no-progress \
+              webhook-relay:ci-scan
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: "v3.16.3"
+
+      - name: render the chart for scanning
+        # Trivy's config scanner is given RENDERED manifests, not the raw
+        # chart. A Helm template is not valid YAML — it is Go templating that
+        # happens to look like YAML — so pointing a config scanner at
+        # deploy/charts/ makes it either skip the files or misparse them.
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/rendered"
+          helm template webhook-relay deploy/charts/webhook-relay \
+            --set image.tag=ci-scan -n webhook-relay \
+            > "${GITHUB_WORKSPACE}/rendered/chart.yaml"
+          cp gitops/apps/*.yaml "${GITHUB_WORKSPACE}/rendered/"
+          echo "rendered $(grep -c '^kind:' "${GITHUB_WORKSPACE}/rendered/chart.yaml") objects"
+
+      - name: Trivy config scan on the rendered manifests
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/rendered:/scan:ro" \
+            -v "${HOME}/.cache/trivy:/root/.cache/trivy" \
+            aquasec/trivy:0.58.1 config \
+              --severity CRITICAL \
+              --exit-code 1 \
+              --quiet \
+              /scan
+
   stack:
     name: compose stack comes up clean
     runs-on: ubuntu-latest

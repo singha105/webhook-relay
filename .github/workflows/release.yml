@@ -1,0 +1,238 @@
+name: Release
+
+# Runs on merge to main. Builds an image, signs it, generates an SBOM, and then
+# COMMITS the new tag into gitops/values.yaml — which is what actually triggers
+# the deployment.
+#
+# WHY THIS PIPELINE NEVER TOUCHES THE CLUSTER
+#
+# The obvious design is: build the image, then `kubectl apply` or `helm upgrade`
+# from CI. That requires giving GitHub Actions a kubeconfig with write access to
+# the cluster, and that is a materially worse security posture:
+#
+#   * A long-lived cluster credential sits in a third party's secret store. Any
+#     workflow in the repository can read it, including one added by a PR that
+#     modifies .github/workflows — a well-known escalation path.
+#   * The cluster must accept inbound connections from GitHub's runner IP
+#     ranges, so the API server is exposed to the internet rather than being
+#     reachable only from inside the network.
+#   * A compromised Actions runner has direct, immediate cluster access. There
+#     is no audit trail beyond the runner's own logs, which the attacker can
+#     influence.
+#
+# Pull-based delivery inverts it. CI can only write to Git. ArgoCD, running
+# INSIDE the cluster, reads from Git and applies. So:
+#
+#   * No cluster credential exists outside the cluster.
+#   * The API server needs no inbound access from the internet at all.
+#   * Every deployment is a commit — reviewable, revertible, and attributable,
+#     with `git log gitops/values.yaml` as the deployment history.
+#   * A compromised runner can at worst commit a bad tag, which is visible in
+#     the diff and revertible by `git revert`.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "gitops/values.yaml" # the commit this workflow makes itself
+  workflow_dispatch:
+
+concurrency:
+  # Never two releases at once: both would push a tag and both would try to
+  # commit to gitops/values.yaml, and the loser's push is rejected.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    name: build, sign, and publish
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write # to commit the tag back
+      packages: write # to push to GHCR
+      # Cosign keyless signing exchanges this OIDC token for a short-lived
+      # certificate from Fulcio. No private key is stored anywhere — which is
+      # the whole point: there is no signing key to leak, and the certificate
+      # binds the signature to this specific workflow in this repository.
+      id-token: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.short_sha }}
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The commit step needs history to push.
+          fetch-depth: 0
+
+      - name: compute the tag
+        id: meta
+        run: |
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          echo "short_sha=sha-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "building sha-${short_sha}"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # The automatic token. No PAT to create, rotate, or leak.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # arm64 as well as amd64: the developer machine is Apple Silicon and
+          # a single-arch amd64 image would run under emulation locally, which
+          # is slow enough to change how the thing behaves under load testing.
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            TARGET=api
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
+          # No :latest tag. A mutable tag means two pods claiming one version
+          # can run different code, and a rollback has nothing to point at.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: sign the image
+        # Keyless: cosign uses the workflow's OIDC identity to obtain a
+        # short-lived certificate, signs, and records the signature in the
+        # public Rekor transparency log. Verification later proves the image
+        # was built by THIS workflow in THIS repository — which a plain
+        # checksum cannot.
+        run: |
+          cosign sign --yes \
+            "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - name: generate an SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: true
+
+      - name: attach and sign the SBOM
+        # An attestation, not just an uploaded file. The SBOM travels with the
+        # image in the registry and is itself signed, so "what is in this
+        # image" is answerable from the image alone — which is what matters
+        # when a CVE lands and you need to know whether you are affected.
+        run: |
+          cosign attest --yes \
+            --predicate sbom.spdx.json \
+            --type spdxjson \
+            "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - name: verify the signature
+        # Verifying what we just signed proves the whole chain works, in the
+        # same run. A signing step that silently no-ops is otherwise invisible
+        # until someone tries to verify months later.
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${IMAGE_NAME}/.github/workflows/release.yml@refs/heads/main$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+  deploy:
+    name: commit the tag (this is the deployment)
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: write the new tag into gitops/values.yaml
+        run: |
+          set -euo pipefail
+          tag="${{ needs.build.outputs.image_tag }}"
+
+          # sed on a specific key, not a blind replace: this file is small and
+          # a broad substitution would be a silent way to corrupt it.
+          sed -i "s|^  tag: .*|  tag: \"${tag}\"|" gitops/values.yaml
+
+          if ! grep -q "tag: \"${tag}\"" gitops/values.yaml; then
+            echo "failed to update the tag in gitops/values.yaml"
+            cat gitops/values.yaml
+            exit 1
+          fi
+          echo "gitops/values.yaml now pins ${tag}"
+
+      - name: commit
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet gitops/values.yaml; then
+            echo "tag unchanged; nothing to deploy"
+            exit 0
+          fi
+
+          git add gitops/values.yaml
+          # [skip ci] so this commit does not retrigger the release workflow.
+          # The paths-ignore above also covers it; both are present because
+          # relying on one silently breaks if the other is edited.
+          git commit -m "deploy: ${{ needs.build.outputs.image_tag }} [skip ci]
+
+          Image:  ${{ needs.build.outputs.image_tag }}
+          Digest: ${{ needs.build.outputs.digest }}
+          Source: ${{ github.sha }}
+
+          ArgoCD reconciles this commit. No cluster credential was used."
+          git push
+
+      - name: summary
+        run: |
+          {
+            echo "### Deployed"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${{ needs.build.outputs.image_tag }}\` |"
+            echo "| Digest | \`${{ needs.build.outputs.digest }}\` |"
+            echo ""
+            echo "ArgoCD will reconcile this commit within its 30s refresh window."
+            echo "No kubeconfig was used by this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"

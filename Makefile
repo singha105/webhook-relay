@@ -193,6 +193,118 @@ build: ## Build both binaries into ./bin
 	$(GO) build -o bin/worker ./cmd/worker
 
 # -----------------------------------------------------------------------------
+# Kubernetes
+#
+# The whole day-4 path: cluster-up creates the cluster, bootstrap provisions
+# everything into it. Both are reproducible from committed files.
+# -----------------------------------------------------------------------------
+
+PROFILE      ?= full
+K3D_CONFIG   := $(if $(filter lowmem,$(PROFILE)),deploy/k3d/cluster-lowmem.yaml,deploy/k3d/cluster.yaml)
+CLUSTER_NAME := webhook-relay
+KUBE_CONTEXT := k3d-$(CLUSTER_NAME)
+TF           := terraform -chdir=terraform
+
+.PHONY: cluster-up
+cluster-up: ## Create the k3d cluster from the committed config
+	@echo "creating cluster from $(K3D_CONFIG) (profile: $(PROFILE))"
+	k3d cluster create --config $(K3D_CONFIG)
+	@kubectl config use-context $(KUBE_CONTEXT) >/dev/null
+	@echo ""
+	@kubectl get nodes
+	@echo ""
+	@echo "  next: make bootstrap"
+
+.PHONY: cluster-down
+cluster-down: ## Destroy the k3d cluster and its registry
+	k3d cluster delete $(CLUSTER_NAME) || true
+	k3d registry delete webhook-relay-registry 2>/dev/null || true
+
+.PHONY: cluster-status
+cluster-status: ## Show what is running in the cluster
+	@kubectl get nodes -o wide
+	@echo ""
+	@kubectl get pods -A --sort-by=.metadata.namespace
+
+.PHONY: bootstrap
+bootstrap: ## Provision everything into the cluster with Terraform
+	$(TF) init -input=false -upgrade
+	$(TF) apply -auto-approve -input=false \
+		-var 'profile=$(PROFILE)' \
+		-var 'kube_context=$(KUBE_CONTEXT)'
+	@$(MAKE) --no-print-directory endpoints
+
+.PHONY: plan
+plan: ## Show what bootstrap would change
+	$(TF) init -input=false
+	$(TF) plan -input=false -var 'profile=$(PROFILE)' -var 'kube_context=$(KUBE_CONTEXT)'
+
+.PHONY: teardown
+teardown: ## Destroy everything Terraform created, keeping the cluster
+	$(TF) destroy -auto-approve -input=false \
+		-var 'profile=$(PROFILE)' -var 'kube_context=$(KUBE_CONTEXT)'
+
+.PHONY: endpoints
+endpoints: ## Print the cluster's URLs and credentials
+	@echo ""
+	@echo "  api:      http://webhook-relay.localhost:8081"
+	@echo "  grafana:  http://grafana.localhost:8081   (admin / see below)"
+	@echo "  argocd:   http://argocd.localhost:8081"
+	@echo "  chaos:    http://chaos.localhost:8081"
+	@echo ""
+	@echo "  These hostnames need to resolve to 127.0.0.1. On macOS/Linux:"
+	@echo "    echo '127.0.0.1 webhook-relay.localhost grafana.localhost argocd.localhost chaos.localhost' | sudo tee -a /etc/hosts"
+	@echo ""
+	@printf "  grafana password: "; $(TF) output -raw grafana_admin_password 2>/dev/null || echo "(run make bootstrap first)"
+	@echo ""
+	@printf "  argocd password:  "; kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' 2>/dev/null | base64 -d || echo "(not ready yet)"
+	@echo ""
+
+.PHONY: chart-sync
+chart-sync: ## Copy /migrations into the chart so the two cannot drift
+	@rm -f deploy/charts/webhook-relay/migrations/*.sql
+	@cp migrations/*.sql deploy/charts/webhook-relay/migrations/
+	@echo "synced $$(ls migrations/*.sql | wc -l | tr -d ' ') migration files into the chart"
+
+.PHONY: chart-lint
+chart-lint: chart-sync ## Lint and render the chart, and validate the output
+	helm lint deploy/charts/webhook-relay --set image.tag=lint-test
+	helm lint deploy/charts/webhook-relay --set image.tag=lint-test -f deploy/charts/webhook-relay/values-dev.yaml
+	@helm template webhook-relay deploy/charts/webhook-relay --set image.tag=lint-test -n webhook-relay \
+		| kubeconform -strict -summary -kubernetes-version 1.31.0 \
+			-schema-location default \
+			-schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+
+.PHONY: tf-check
+tf-check: ## terraform fmt and validate
+	$(TF) fmt -check -recursive -diff
+	$(TF) init -backend=false -input=false >/dev/null
+	$(TF) validate
+
+.PHONY: image-dev
+image-dev: ## Build the image and push it to the cluster's local registry
+	docker build -t localhost:5111/webhook-relay:dev --build-arg TARGET=api .
+	docker push localhost:5111/webhook-relay:dev
+	@echo "pushed localhost:5111/webhook-relay:dev"
+
+.PHONY: seal-backup
+seal-backup: ## Export the Sealed Secrets private key (gitignored; back this up)
+	@kubectl -n kube-system get secret \
+		-l sealedsecrets.bitnami.com/sealed-secrets-key -o yaml > sealed-secrets-key.yaml
+	@echo "wrote sealed-secrets-key.yaml"
+	@echo "WITHOUT THIS, a recreated cluster cannot decrypt any committed SealedSecret."
+
+.PHONY: argocd-sync
+argocd-sync: ## Force ArgoCD to reconcile now
+	kubectl -n argocd patch application webhook-relay --type merge \
+		-p '{"operation":{"initiatedBy":{"username":"make"},"sync":{"revision":"HEAD"}}}'
+
+.PHONY: argocd-status
+argocd-status: ## Show ArgoCD application health and sync state
+	@kubectl -n argocd get applications -o custom-columns=\
+NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REVISION:.status.sync.revision
+
+# -----------------------------------------------------------------------------
 # Repo hygiene
 # -----------------------------------------------------------------------------
 

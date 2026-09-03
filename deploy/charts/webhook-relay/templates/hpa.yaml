@@ -1,0 +1,68 @@
+{{- if .Values.api.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-api
+  labels:
+    {{- include "webhook-relay.componentLabels" (dict "root" . "component" "api") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "webhook-relay.fullname" . }}-api
+  minReplicas: {{ .Values.api.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.api.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.api.autoscaling.targetCPUUtilizationPercentage }}
+    {{- if .Values.api.autoscaling.queueDepth.enabled }}
+    {{/*
+      Scaling on queue depth as well as CPU.
+
+      CPU alone is the wrong signal for this service. Ingest is cheap — decode,
+      validate, one INSERT — so the API can sit near-idle while the backlog
+      grows, and a CPU-only HPA would never react to the condition customers
+      actually feel.
+
+      This requires prometheus-adapter to expose webhook_queue_depth as an
+      External metric; without it the HPA reports <unknown> for this metric and
+      falls back to CPU alone. It is off by default for that reason: an HPA
+      referencing a metric nobody serves is a silently degraded autoscaler.
+    */}}
+    - type: External
+      external:
+        metric:
+          name: webhook_queue_depth
+          selector:
+            matchLabels:
+              namespace: {{ .Release.Namespace }}
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.api.autoscaling.queueDepth.targetAverageValue | quote }}
+    {{- end }}
+  behavior:
+    scaleUp:
+      # React quickly to load: the cost of an extra API pod is small, the cost
+      # of shedding ingest is an event the customer must retry.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      # Come down slowly. Aggressive scale-down after a burst is how you get
+      # flapping — the replicas leave, latency rises, they come back.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+{{- end }}

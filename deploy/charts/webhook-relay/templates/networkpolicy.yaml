@@ -1,0 +1,265 @@
+{{- if .Values.networkPolicy.enabled }}
+{{/*
+  NetworkPolicies.
+
+  The model is default-deny, then allow exactly what each workload needs. That
+  ordering matters: an allow-list added to a default-allow cluster documents
+  intent but enforces nothing, because anything not mentioned is still
+  permitted.
+
+  Kubernetes NetworkPolicy is additive — policies union, they never subtract —
+  so the deny-all below is not overridden by the allows; the allows carve holes
+  in it. There is no way to express "deny X" once something else allows it,
+  which is why the deny is written as "select everything, permit nothing" and
+  every permitted flow is enumerated.
+
+  Requires a CNI that enforces policy. k3s ships Flannel, which does NOT — the
+  objects are accepted and silently ignored. See docs/runbook.md; the cluster
+  config would need --flannel-backend=none with Calico or Cilium for real
+  enforcement. They are committed anyway because they are the deployable
+  artifact a reviewer reads, and because Day 5's chaos work is the natural
+  place to swap the CNI.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-default-deny
+  labels:
+    {{- include "webhook-relay.labels" . | nindent 4 }}
+spec:
+  # Empty selector = every pod in the namespace.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress or egress rules at all: nothing in, nothing out, until a later
+  # policy permits it.
+---
+{{/*
+  Both workloads need DNS. Without this every other rule is useless, because
+  resolving `webhook-relay-db-rw` fails before a connection is ever attempted —
+  and the symptom is a name-resolution error that looks nothing like a network
+  policy problem.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-allow-dns
+  labels:
+    {{- include "webhook-relay.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+{{/*
+  API ingress: ONLY from the ingress controller.
+
+  Not from anywhere in the cluster, and not from the worker. The API is a
+  customer-facing entry point; anything else reaching it directly would bypass
+  the ingress's rate limits, TLS termination and access logs.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-api-ingress
+  labels:
+    {{- include "webhook-relay.componentLabels" (dict "root" . "component" "api") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "webhook-relay.componentSelectorLabels" (dict "root" . "component" "api") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.api.service.targetPort }}
+    # Prometheus scrapes /metrics on the same port. Without this the API's
+    # metrics simply stop appearing, with no error anywhere except a "context
+    # deadline exceeded" on the scrape target page.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.observabilityNamespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.api.service.targetPort }}
+---
+{{/*
+  API egress: Postgres, Valkey, the collector. NOT the internet.
+
+  This is the asymmetry that matters. The API never makes an outbound webhook
+  call — that is the worker's job — so it has no business reaching an arbitrary
+  address. Denying it means an SSRF in the ingest path cannot become an
+  outbound request, even though the API accepts customer-supplied URLs when
+  registering endpoints.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-api-egress
+  labels:
+    {{- include "webhook-relay.componentLabels" (dict "root" . "component" "api") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "webhook-relay.componentSelectorLabels" (dict "root" . "component" "api") | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: webhook-relay-db
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: valkey
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.observabilityNamespace }}
+      ports:
+        - protocol: TCP
+          port: 4317
+---
+{{/*
+  Worker egress: Postgres, Valkey, and the whole internet.
+
+  The worker MUST reach arbitrary external addresses — delivering to
+  customer-registered URLs is its entire purpose — so a destination allow-list
+  is impossible. What is possible is excluding the cluster's own private
+  ranges, so a customer cannot register http://10.x.x.x/ and use our worker to
+  scan the internal network. That is the SSRF protection the Day 1 README
+  listed as a known gap, enforced here at the network layer rather than by URL
+  validation that an attacker can encode around.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-worker-egress
+  labels:
+    {{- include "webhook-relay.componentLabels" (dict "root" . "component" "worker") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "webhook-relay.componentSelectorLabels" (dict "root" . "component" "worker") | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: webhook-relay-db
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: valkey
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.observabilityNamespace }}
+      ports:
+        - protocol: TCP
+          port: 4317
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # RFC1918 and link-local. The cluster's pod and service CIDRs sit
+              # inside these, so excluding them denies lateral movement while
+              # still permitting delivery to any public endpoint.
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+---
+{{/*
+  Worker ingress: scraping only. Nothing calls the worker.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-worker-ingress
+  labels:
+    {{- include "webhook-relay.componentLabels" (dict "root" . "component" "worker") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "webhook-relay.componentSelectorLabels" (dict "root" . "component" "worker") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.observabilityNamespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.worker.metricsPort }}
+---
+{{/*
+  Postgres and Valkey accept connections only from our two workloads and from
+  Prometheus. CloudNativePG also needs instance-to-instance traffic for
+  streaming replication, which is why the cnpg.io/cluster selector appears on
+  both sides.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-datastores-ingress
+  labels:
+    {{- include "webhook-relay.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: ["valkey"]
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "webhook-relay.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 6379
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.observabilityNamespace }}
+{{- end }}

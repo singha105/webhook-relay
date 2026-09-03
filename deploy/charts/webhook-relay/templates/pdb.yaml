@@ -1,0 +1,43 @@
+{{- if .Values.api.podDisruptionBudget.enabled }}
+{{/*
+  A PodDisruptionBudget bounds VOLUNTARY disruption only — a node drain, a
+  cluster upgrade, a `kubectl drain`. It does nothing about a node dying, which
+  is what topologySpreadConstraints are for.
+
+  Without this, draining a node evicts every pod on it at once. With two
+  replicas that can happen to be co-located, that is the entire API gone while
+  the replacement pods pull an image.
+*/}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-api
+  labels:
+    {{- include "webhook-relay.componentLabels" (dict "root" . "component" "api") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.api.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "webhook-relay.componentSelectorLabels" (dict "root" . "component" "api") | nindent 6 }}
+{{- end }}
+---
+{{- if .Values.worker.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-worker
+  labels:
+    {{- include "webhook-relay.componentLabels" (dict "root" . "component" "worker") | nindent 4 }}
+spec:
+  {{/*
+    The worker's budget matters for a different reason than the API's. Losing
+    every worker at once does not drop requests — the queue holds the work —
+    but it does mean nothing is delivering until replacements are ready, and
+    every claimed-but-unacked entry waits out the stale-claim timeout before
+    another worker can take it. Keeping one alive keeps delivery moving.
+  */}}
+  minAvailable: {{ .Values.worker.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "webhook-relay.componentSelectorLabels" (dict "root" . "component" "worker") | nindent 6 }}
+{{- end }}

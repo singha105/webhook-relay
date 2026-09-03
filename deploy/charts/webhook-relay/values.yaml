@@ -1,0 +1,250 @@
+# Default values for webhook-relay.
+#
+# Every value here is production-shaped. values-dev.yaml overrides the handful
+# that should differ on a laptop, so the difference between the two is small
+# enough to read in one screen.
+
+# ---------------------------------------------------------------------------
+# Image
+#
+# One image, two Deployments. The api and worker are different commands over
+# the same binary set, which means they can never drift to different versions
+# of the shared store, queue, and delivery code — a class of bug that separate
+# images invite and that is miserable to diagnose.
+# ---------------------------------------------------------------------------
+image:
+  repository: ghcr.io/singha105/webhook-relay
+  # Overwritten by the release pipeline with a git SHA. Never "latest":
+  # a mutable tag means two pods claiming the same version can be running
+  # different code, and a rollback has nothing to roll back to.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# Configuration shared by both workloads
+# ---------------------------------------------------------------------------
+config:
+  logLevel: info
+  serviceVersion: ""
+
+  database:
+    # CloudNativePG publishes a read-write service that always points at the
+    # current primary. Using it rather than a pod name is what makes failover
+    # transparent to the application.
+    host: webhook-relay-db-rw
+    port: 5432
+    name: webhook_relay
+    sslMode: disable
+    # Credentials come from a Secret, never from values.
+    existingSecret: webhook-relay-db-credentials
+    usernameKey: username
+    passwordKey: password
+
+  valkey:
+    host: valkey-master
+    port: 6379
+
+  otlp:
+    endpoint: tempo.observability.svc.cluster.local:4317
+    tracingEnabled: true
+    sampleRatio: "1.0"
+
+  delivery:
+    timeout: 10s
+    maxAttempts: 6
+    retryBaseDelay: 1s
+    retryMaxDelay: 1h
+    # These three have an ordering the application validates at boot:
+    #   deliveryTimeout < staleClaimTimeout < deliveryLease
+    # Violate the first and healthy in-flight deliveries get reclaimed and
+    # duplicated; violate the second and the relay requeues work the workers
+    # still hold.
+    staleClaimTimeout: 60s
+    deliveryLease: 5m
+    dedupEnabled: true
+
+  resilience:
+    rateLimitEnabled: true
+    breakerEnabled: true
+    breakerThreshold: 10
+    breakerCooldown: 5m
+
+  readiness:
+    # Fails API readiness when the oldest undelivered event exceeds this,
+    # shedding ingest while workers catch up. Zero disables it.
+    maxBacklogAge: 2m
+
+# ---------------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------------
+api:
+  replicaCount: 2
+
+  # Requests are what the scheduler packs against; limits are what the kernel
+  # enforces. Both are set deliberately:
+  #
+  #   cpu request 100m  — measured idle-to-light load. Setting it too high
+  #                       wastes schedulable capacity on a small cluster.
+  #   NO cpu limit      — a CPU limit throttles rather than kills, and CFS
+  #                       throttling on a latency-sensitive HTTP path produces
+  #                       tail latency that looks like a network problem. The
+  #                       request plus the HPA is the right control.
+  #   memory 128Mi/256Mi — Go's heap here is dominated by request buffers.
+  #                       Memory limit == request would make the pod OOM on any
+  #                       spike; 2x headroom absorbs a burst without letting a
+  #                       leak run unbounded.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+    # Scale on queue depth as well as CPU. CPU alone is the wrong signal for
+    # this service: ingest is cheap, so the API can be nearly idle while the
+    # backlog grows. Depth is what a customer actually feels.
+    queueDepth:
+      enabled: false # requires prometheus-adapter; see values-dev.yaml
+      targetAverageValue: "100"
+
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 8080
+
+  ingress:
+    enabled: true
+    className: nginx
+    annotations: {}
+    hosts:
+      - host: webhook-relay.localhost
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+
+  podDisruptionBudget:
+    enabled: true
+    # minAvailable rather than maxUnavailable: with 2 replicas, maxUnavailable=1
+    # permits both to go down if the replica count ever drops to 1, whereas
+    # minAvailable=1 always keeps one serving.
+    minAvailable: 1
+
+# ---------------------------------------------------------------------------
+# Worker
+# ---------------------------------------------------------------------------
+worker:
+  replicaCount: 2
+
+  # The worker is the opposite shape to the API: it holds a connection pool, a
+  # queue consumer group, and up to `concurrency` outbound HTTP calls in
+  # flight, so its memory floor is higher and its CPU is bursty rather than
+  # sustained.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 192Mi
+    limits:
+      memory: 384Mi
+
+  concurrency: 10
+  drainTimeout: 30s
+  metricsPort: 9100
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  # No HPA. Worker throughput is bounded by the endpoints' own rate limits, not
+  # by our CPU, so scaling out on CPU would add consumers that immediately
+  # block on a token bucket. Day 6's load test is what should inform this.
+  autoscaling:
+    enabled: false
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+lifecycle:
+  # See the templates for the full SIGTERM ordering argument. The short version:
+  # terminationGracePeriodSeconds must exceed preStopDelay + drainTimeout, or
+  # the kubelet SIGKILLs a pod that is still finishing a delivery.
+  preStopDelaySeconds: 5
+
+# ---------------------------------------------------------------------------
+# Migrations
+# ---------------------------------------------------------------------------
+migrations:
+  enabled: true
+  image:
+    repository: migrate/migrate
+    tag: v4.18.1
+  # Kept short: a migration that takes minutes is blocking every replica of the
+  # new version from starting.
+  activeDeadlineSeconds: 300
+  backoffLimit: 3
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  scrapeTimeout: 10s
+  labels: {}
+
+# ---------------------------------------------------------------------------
+# Network policy
+# ---------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Namespace labels the policies select on. These must match what Terraform
+  # applied to the namespaces.
+  ingressNamespace: ingress-nginx
+  observabilityNamespace: observability
+
+# ---------------------------------------------------------------------------
+# Scheduling
+# ---------------------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+# Spread replicas across nodes so a single node failure cannot take out every
+# replica of either workload. ScheduleAnyway rather than DoNotSchedule: on a
+# single-node cluster a hard constraint leaves pods permanently Pending.
+topologySpreadConstraints:
+  enabled: true
+  maxSkew: 1
+  whenUnsatisfiable: ScheduleAnyway
+
+podAnnotations: {}
+podLabels: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Pod-level security. The image is distroless and already runs as nonroot;
+# these make that explicit and enforceable rather than incidental.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL

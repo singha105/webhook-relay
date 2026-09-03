@@ -1,0 +1,87 @@
+# k3d cluster definition for webhook-relay.
+#
+# Everything about the cluster lives here rather than in flags someone typed
+# once. `make cluster-up` reads this file and nothing else, so the cluster a
+# reviewer creates is byte-identical to the one this was developed against.
+#
+# Sizing note: this fits a laptop with ~6 GiB allocated to Docker. The full
+# stack — CloudNativePG with 3 Postgres replicas, kube-prometheus-stack, ArgoCD,
+# Tempo, Loki, ingress-nginx and Chaos Mesh — needs roughly 5.6 GiB inside the
+# cluster. See deploy/k3d/cluster-lowmem.yaml for a 1-agent profile that trims
+# it to ~3.4 GiB.
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: webhook-relay
+
+servers: 1
+agents: 2
+
+image: docker.io/rancher/k3s:v1.31.4-k3s1
+
+# A registry inside the cluster network. The release pipeline pushes to GHCR,
+# but local development needs somewhere to put an image without a round trip to
+# the internet — and without it, testing a code change means waiting on a GitHub
+# Actions run.
+registries:
+  create:
+    name: webhook-relay-registry
+    host: "0.0.0.0"
+    hostPort: "5111"
+  config: |
+    mirrors:
+      "webhook-relay-registry:5000":
+        endpoint:
+          - http://webhook-relay-registry:5000
+
+ports:
+  # The ingress controller's HTTP port, published on the host so the API is
+  # reachable at http://localhost:8081 without port-forwarding.
+  #
+  # nodeFilters targets the loadbalancer, not a node: k3d runs a small nginx in
+  # front of the cluster, and mapping to a node directly would break the moment
+  # that node is drained — which Day 5 does on purpose.
+  - port: "8081:80"
+    nodeFilters:
+      - loadbalancer
+  - port: "8443:443"
+    nodeFilters:
+      - loadbalancer
+
+options:
+  k3d:
+    wait: true
+    timeout: "300s"
+    disableLoadbalancer: false
+    disableImageVolume: false
+
+  k3s:
+    extraArgs:
+      # Traefik ships with k3s and would fight ingress-nginx for port 80.
+      # We install ingress-nginx via Terraform instead, so that the ingress is
+      # provisioned by code like everything else rather than being whatever
+      # k3s happened to bundle.
+      - arg: --disable=traefik
+        nodeFilters:
+          - server:*
+      # k3s installs its own ServiceLB (klipper). ingress-nginx is exposed
+      # through the k3d loadbalancer instead, so this is dead weight.
+      - arg: --disable=servicelb
+        nodeFilters:
+          - server:*
+      # Metrics-server IS kept: the HPA on the api deployment needs it for CPU
+      # metrics, and without it the HPA silently reports <unknown>/70%.
+      - arg: --disable=metrics-server=false
+        nodeFilters:
+          - server:*
+
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true
+
+  runtime:
+    # Per-node memory ceilings. Without these a single runaway pod can consume
+    # everything Docker will give the VM and take the whole cluster with it,
+    # which on a laptop means the desktop stops responding too.
+    serversMemory: 2g
+    agentsMemory: 2g
