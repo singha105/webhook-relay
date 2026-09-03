@@ -95,28 +95,28 @@ func TestRelayReleasesClaimsItCouldNotEnqueue(t *testing.T) {
 
 	const total = 10
 	const willSucceed = 4
-	ids := make([]uuid.UUID, 0, total)
 	for i := 0; i < total; i++ {
 		id, err := models.NewEventID()
 		if err != nil {
 			t.Fatalf("NewEventID() = %v", err)
 		}
-		ev, _, err := st.CreateEvent(ctx, id, ep.ID, "order.created", json.RawMessage(`{"a":1}`), nil)
-		if err != nil {
+		if _, _, err := st.CreateEvent(ctx, id, ep.ID, "order.created", json.RawMessage(`{"a":1}`), nil); err != nil {
 			t.Fatalf("CreateEvent() = %v", err)
 		}
-		ids = append(ids, ev.ID)
 	}
 
 	q := &partialQueue{succeed: willSucceed}
 	r := relay.New(st, q, slog.New(slog.NewTextHandler(io.Discard, nil)), relay.Config{BatchSize: total, PollInterval: 20 * time.Millisecond})
 
-	batches := runOneRelayPass(t, r, q)
-	if len(batches) == 0 {
-		t.Fatal("the relay never enqueued anything")
-	}
+	// Wait for a second pass. This is the race-free way to prove the release
+	// happened: an event that was NOT released stays in 'delivering' forever
+	// and can never be claimed again, so it cannot appear in a later batch.
+	// Asserting on the database instead would be a race — a released event is
+	// immediately due again, so the relay re-claims it and the row oscillates.
+	batches := waitForBatches(t, r, q, 2)
+
 	if got := len(batches[0]); got != total {
-		t.Errorf("first batch carried %d items, want all %d in one call", got, total)
+		t.Fatalf("first batch carried %d items, want all %d in one call", got, total)
 	}
 
 	// Every item must carry a context for its own trace; a nil one would mean
@@ -127,28 +127,34 @@ func TestRelayReleasesClaimsItCouldNotEnqueue(t *testing.T) {
 		}
 	}
 
-	// The 4 that made it stay claimed; the 6 that did not are released.
-	var delivering, released int
-	for _, id := range ids {
-		ev, err := st.GetEvent(ctx, id)
-		if err != nil {
-			t.Fatalf("GetEvent(%s) = %v", id, err)
-		}
-		switch ev.Status {
-		case models.StatusDelivering:
-			delivering++
-		case models.StatusPending, models.StatusFailed:
-			released++
-		default:
-			t.Errorf("event %s is %q, want delivering or released", id, ev.Status)
+	// The first willSucceed items were enqueued and keep their claim. The rest
+	// had a lease and no message, so the relay must have released them — which
+	// is exactly the set the next pass re-claims.
+	wantRetried := make(map[uuid.UUID]bool, total-willSucceed)
+	for _, it := range batches[0][willSucceed:] {
+		wantRetried[it.EventID] = true
+	}
+	gotRetried := make(map[uuid.UUID]bool, len(batches[1]))
+	for _, it := range batches[1] {
+		gotRetried[it.EventID] = true
+	}
+
+	if len(gotRetried) != len(wantRetried) {
+		t.Errorf("second pass re-claimed %d events, want %d (the ones that failed to enqueue)",
+			len(gotRetried), len(wantRetried))
+	}
+	for id := range wantRetried {
+		if !gotRetried[id] {
+			t.Errorf("event %s failed to enqueue but was never re-claimed; "+
+				"it is stranded in 'delivering' until its lease expires", id)
 		}
 	}
-	if delivering != willSucceed {
-		t.Errorf("%d events left claimed, want %d (the ones actually enqueued)", delivering, willSucceed)
-	}
-	if released != total-willSucceed {
-		t.Errorf("%d events released, want %d — the rest are stranded until their lease expires",
-			released, total-willSucceed)
+	// The successfully enqueued ones must NOT come back: they hold a valid
+	// claim and a real queue message, so re-claiming them would double-deliver.
+	for _, it := range batches[0][:willSucceed] {
+		if gotRetried[it.EventID] {
+			t.Errorf("event %s was enqueued successfully but got re-claimed", it.EventID)
+		}
 	}
 }
 
@@ -178,20 +184,20 @@ func TestRelayBatchesTheWholeClaim(t *testing.T) {
 	q := &partialQueue{succeed: total}
 	r := relay.New(st, q, slog.New(slog.NewTextHandler(io.Discard, nil)), relay.Config{BatchSize: total, PollInterval: 20 * time.Millisecond})
 
-	batches := runOneRelayPass(t, r, q)
-	if len(batches) != 1 {
-		t.Fatalf("made %d enqueue calls for %d events, want exactly 1", len(batches), total)
-	}
+	batches := waitForBatches(t, r, q, 1)
 	if got := len(batches[0]); got != total {
-		t.Errorf("batch carried %d items, want all %d", got, total)
+		t.Errorf("first batch carried %d items, want all %d in one call, "+
+			"not one call per event", got, total)
 	}
 }
 
-// runOneRelayPass starts the relay, waits for it to drain what is due, and
-// stops it. Driving Run rather than the unexported relayOnce keeps this an
-// external test — the test helpers import relay, so an internal test would be
-// an import cycle.
-func runOneRelayPass(t *testing.T, r *relay.Relay, q *partialQueue) [][]queue.EnqueueItem {
+// waitForBatches starts the relay, waits until it has made at least n enqueue
+// calls, and stops it.
+//
+// Driving Run rather than the unexported relayOnce keeps this an external test:
+// the shared test helpers import relay, so an internal test would be an import
+// cycle.
+func waitForBatches(t *testing.T, r *relay.Relay, q *partialQueue, n int) [][]queue.EnqueueItem {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -199,25 +205,22 @@ func runOneRelayPass(t *testing.T, r *relay.Relay, q *partialQueue) [][]queue.En
 		defer close(done)
 		_ = r.Run(ctx)
 	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
 
-	deadline := time.After(15 * time.Second)
+	deadline := time.After(20 * time.Second)
 	for {
-		if len(q.seen()) > 0 {
-			// Give the pass a moment to finish its release work, then stop.
-			time.Sleep(300 * time.Millisecond)
-			break
+		if got := q.seen(); len(got) >= n {
+			return got
 		}
 		select {
 		case <-deadline:
-			cancel()
-			<-done
-			t.Fatal("relay did not enqueue within 15s")
+			t.Fatalf("relay made %d enqueue calls in 20s, want %d", len(q.seen()), n)
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	cancel()
-	<-done
-	return q.seen()
 }
 
 var _ queue.Queue = (*partialQueue)(nil)
