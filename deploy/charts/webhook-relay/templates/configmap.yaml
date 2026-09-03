@@ -1,0 +1,35 @@
+{{/*
+A ConfigMap that exists mostly so the Deployments have something to checksum.
+
+Every real setting is passed as an environment variable, because the
+application reads only the environment (see internal/config) — deliberately, so
+that a container has one source of configuration rather than two that can
+disagree. This ConfigMap carries the non-secret values as a record of what the
+release was configured with, which makes `kubectl describe cm` a useful thing
+to do during an incident, and gives the pod template a stable checksum to roll
+on when configuration changes.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-config
+  labels:
+    {{- include "webhook-relay.labels" . | nindent 4 }}
+data:
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  VALKEY_URL: "redis://{{ .Values.config.valkey.host }}:{{ .Values.config.valkey.port }}"
+  OTLP_ENDPOINT: {{ .Values.config.otlp.endpoint | quote }}
+  TRACING_ENABLED: {{ .Values.config.otlp.tracingEnabled | quote }}
+  TRACE_SAMPLE_RATIO: {{ .Values.config.otlp.sampleRatio | quote }}
+  DELIVERY_TIMEOUT: {{ .Values.config.delivery.timeout | quote }}
+  MAX_ATTEMPTS: {{ .Values.config.delivery.maxAttempts | quote }}
+  STALE_CLAIM_TIMEOUT: {{ .Values.config.delivery.staleClaimTimeout | quote }}
+  DELIVERY_LEASE: {{ .Values.config.delivery.deliveryLease | quote }}
+  DELIVERY_DEDUP_ENABLED: {{ .Values.config.delivery.dedupEnabled | quote }}
+  RATE_LIMIT_ENABLED: {{ .Values.config.resilience.rateLimitEnabled | quote }}
+  BREAKER_ENABLED: {{ .Values.config.resilience.breakerEnabled | quote }}
+  BREAKER_THRESHOLD: {{ .Values.config.resilience.breakerThreshold | quote }}
+  BREAKER_COOLDOWN: {{ .Values.config.resilience.breakerCooldown | quote }}
+  WORKER_CONCURRENCY: {{ .Values.worker.concurrency | quote }}
+  DRAIN_TIMEOUT: {{ .Values.worker.drainTimeout | quote }}
+  READINESS_MAX_BACKLOG_AGE: {{ .Values.config.readiness.maxBacklogAge | quote }}

@@ -1,0 +1,23 @@
+apiVersion: v2
+name: webhook-relay
+description: Reliable webhook delivery with at-least-once semantics, retries, and chaos-tested failure modes.
+type: application
+
+# Chart version tracks the chart's own shape. appVersion tracks the image and
+# is overwritten by the release pipeline, which is why it is a placeholder
+# rather than a real tag — the value that actually deploys lives in
+# gitops/values.yaml.
+version: 0.4.0
+appVersion: "0.0.0-dev"
+
+home: https://github.com/singha105/webhook-relay
+sources:
+  - https://github.com/singha105/webhook-relay
+
+maintainers:
+  - name: Arnab Singh
+
+keywords:
+  - webhooks
+  - delivery
+  - queue

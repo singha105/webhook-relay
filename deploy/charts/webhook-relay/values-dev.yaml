@@ -1,0 +1,46 @@
+# Development overrides for the local k3d cluster.
+#
+# Deliberately short. If this file grows large it means values.yaml has stopped
+# describing something deployable and has become a template for two different
+# systems.
+
+image:
+  # The local registry k3d creates. The release pipeline pushes to GHCR; this
+  # is for iterating on a change without waiting for a CI run.
+  repository: webhook-relay-registry:5000/webhook-relay
+  tag: dev
+  pullPolicy: Always
+
+config:
+  logLevel: debug
+  otlp:
+    sampleRatio: "1.0"
+
+api:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      memory: 192Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+  ingress:
+    hosts:
+      - host: webhook-relay.localhost
+        paths:
+          - path: /
+            pathType: Prefix
+
+worker:
+  replicaCount: 2
+  concurrency: 5
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi

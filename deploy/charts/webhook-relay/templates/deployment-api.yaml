@@ -1,0 +1,193 @@
+{{- $ctx := dict "root" . "component" "api" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-api
+  labels:
+    {{- include "webhook-relay.componentLabels" $ctx | nindent 4 }}
+spec:
+  {{- if not .Values.api.autoscaling.enabled }}
+  replicas: {{ .Values.api.replicaCount }}
+  {{- end }}
+  {{/*
+    replicas is omitted entirely when the HPA is enabled. Setting it alongside
+    an HPA makes Helm and the autoscaler fight: every `helm upgrade` resets the
+    count to the chart's value, the HPA scales it back, and the deployment
+    thrashes. ArgoCD makes this worse — it sees the HPA's change as drift and
+    reverts it every reconcile.
+  */}}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never drop below the current capacity during a rollout: the API is the
+      # ingest path, and a rejected POST is an event the customer has to retry.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "webhook-relay.componentSelectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Roll the pods when configuration changes. Without this a values edit
+        # updates the ConfigMap and nothing restarts to read it.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "webhook-relay.componentLabels" $ctx | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "webhook-relay.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+
+      {{/*
+        SIGTERM ordering, which is the whole reason preStop exists here.
+
+        When a pod is deleted, TWO things happen concurrently and Kubernetes
+        does not order them:
+
+          A. The kubelet sends SIGTERM to the container.
+          B. The endpoints controller removes the pod from the Service, and
+             kube-proxy / the ingress controller update their routing.
+
+        (B) is eventually consistent and takes a second or two. If the process
+        exits the instant it gets SIGTERM, requests are still being routed to
+        an address with nothing listening — the client sees connection refused,
+        which for the ingest path means a dropped event.
+
+        The preStop sleep closes that window. The container keeps serving for
+        preStopDelaySeconds while the endpoint removal propagates, and only
+        THEN does the kubelet send SIGTERM and the app begin its own drain.
+
+        Full sequence:
+          t=0    pod marked Terminating; endpoint removal starts; preStop sleep begins
+          t=5    preStop returns; SIGTERM delivered
+          t=5    app stops accepting new work, finishes in-flight requests
+          t=?    app exits
+          t=45   terminationGracePeriodSeconds expires; SIGKILL if still alive
+
+        terminationGracePeriodSeconds is computed as
+        preStopDelay + drainTimeout + 10s of slack, so the SIGKILL deadline
+        always sits beyond the app's own drain budget.
+      */}}
+      terminationGracePeriodSeconds: {{ include "webhook-relay.terminationGracePeriod" . }}
+
+      {{- if .Values.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.topologySpreadConstraints.maxSkew }}
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: {{ .Values.topologySpreadConstraints.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "webhook-relay.componentSelectorLabels" $ctx | nindent 14 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: api
+          image: {{ include "webhook-relay.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.service.targetPort }}
+              protocol: TCP
+          env:
+            {{- include "webhook-relay.commonEnv" . | nindent 12 }}
+            - name: HTTP_ADDR
+              value: ":{{ .Values.api.service.targetPort }}"
+            - name: READINESS_MAX_BACKLOG_AGE
+              value: {{ .Values.config.readiness.maxBacklogAge | quote }}
+            - name: SHUTDOWN_TIMEOUT
+              value: {{ .Values.worker.drainTimeout | quote }}
+
+          {{/*
+            Liveness and readiness are different endpoints on purpose.
+
+            /healthz touches NO dependency. A liveness probe that checked
+            Postgres would kill every replica simultaneously during a database
+            blip, turning a recoverable outage into a CrashLoopBackOff that
+            outlasts the outage itself — and destroys the logs of the pods that
+            saw it.
+
+            /readyz checks Postgres, Valkey, and the backlog age. Failing it
+            removes the pod from the Service without killing it, so the pod
+            keeps running, keeps being scraped, and rejoins on its own.
+          */}}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            # Three strikes before a restart. One failed probe during a GC
+            # pause is not a broken process.
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            # Fail fast out of the Service — the cost of removing a healthy pod
+            # for 5s is far lower than the cost of routing to a broken one.
+            failureThreshold: 2
+            successThreshold: 1
+
+          # Bounds how long a slow start blocks the rollout, without the
+          # coarse initialDelaySeconds trade-off on the liveness probe.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 20
+
+          lifecycle:
+            preStop:
+              # The native sleep action, not an exec. The runtime image is
+              # distroless — no shell, no /bin/sleep — so the usual
+              # `exec: ["sh","-c","sleep 5"]` would fail to start and the
+              # kubelet would proceed straight to SIGTERM, silently removing
+              # the very delay this exists to provide.
+              #
+              # Requires Kubernetes >= 1.29 (PodLifecycleSleepAction, GA in
+              # 1.30). k3s v1.31 in deploy/k3d/cluster.yaml satisfies that.
+              sleep:
+                seconds: {{ .Values.lifecycle.preStopDelaySeconds }}
+
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+
+          volumeMounts:
+            # readOnlyRootFilesystem is on, so anything that needs to write
+            # needs an explicit emptyDir. Go writes nothing here, but the
+            # runtime wants /tmp to exist.
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi

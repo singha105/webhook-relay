@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-api
+  labels:
+    {{- include "webhook-relay.componentLabels" (dict "root" . "component" "api") | nindent 4 }}
+spec:
+  type: {{ .Values.api.service.type }}
+  ports:
+    - port: {{ .Values.api.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "webhook-relay.componentSelectorLabels" (dict "root" . "component" "api") | nindent 4 }}
+---
+{{/*
+A headless-ish service for the worker, existing only so the ServiceMonitor has
+something to select. The worker serves no traffic; it only needs to be
+scrapeable.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-worker-metrics
+  labels:
+    {{- include "webhook-relay.componentLabels" (dict "root" . "component" "worker") | nindent 4 }}
+spec:
+  type: ClusterIP
+  # No cluster IP: nothing load-balances to the worker, and a virtual IP would
+  # imply it is a service to call.
+  clusterIP: None
+  ports:
+    - port: {{ .Values.worker.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+  selector:
+    {{- include "webhook-relay.componentSelectorLabels" (dict "root" . "component" "worker") | nindent 4 }}

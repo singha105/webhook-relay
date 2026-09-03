@@ -1,0 +1,30 @@
+{{- if .Values.migrations.enabled }}
+{{/*
+  The .sql files, shipped as a ConfigMap.
+
+  .Files.Glob reads them from the chart at package time, so the migrations that
+  run are exactly the ones in the chart that was deployed — not whatever
+  happens to be on a branch when the job starts. That matters for rollback: an
+  older chart carries its own older migration set.
+
+  A ConfigMap is limited to ~1 MiB total. These files are a few kilobytes; if
+  they ever approach that limit the answer is an init container that fetches
+  them, not a bigger ConfigMap.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-migrations
+  labels:
+    {{- include "webhook-relay.labels" . | nindent 4 }}
+  annotations:
+    # Must exist before the migration Job that mounts it, hence a lower weight.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+data:
+  {{- range $path, $_ := .Files.Glob "migrations/*.sql" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+  {{- end }}
+{{- end }}

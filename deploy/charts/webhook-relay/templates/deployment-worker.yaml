@@ -1,0 +1,149 @@
+{{- $ctx := dict "root" . "component" "worker" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-worker
+  labels:
+    {{- include "webhook-relay.componentLabels" $ctx | nindent 4 }}
+spec:
+  {{- if not .Values.worker.autoscaling.enabled }}
+  replicas: {{ .Values.worker.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Unlike the API, the worker tolerates going briefly under capacity: the
+      # queue holds the work, and the outbox relay re-enqueues anything a
+      # departing worker did not finish. maxUnavailable: 1 makes a rollout
+      # faster without risking loss.
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "webhook-relay.componentSelectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "webhook-relay.componentLabels" $ctx | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "webhook-relay.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+
+      {{/*
+        The worker's grace period matters more than the API's.
+
+        A worker holds claimed queue entries and up to `concurrency` outbound
+        HTTP calls in flight. On SIGTERM it stops claiming and drains — see
+        internal/worker.Drain. If the kubelet SIGKILLs it mid-drain, those
+        entries are never acked, sit in the pending list until the stale-claim
+        timeout, and are then redelivered: a duplicate delivery caused purely
+        by a rollout.
+
+        So the grace period must cover preStop delay + the app's own drain
+        budget, with slack. It is computed, not hand-set, so changing
+        worker.drainTimeout cannot leave the two inconsistent.
+      */}}
+      terminationGracePeriodSeconds: {{ include "webhook-relay.terminationGracePeriod" . }}
+
+      {{- if .Values.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.topologySpreadConstraints.maxSkew }}
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: {{ .Values.topologySpreadConstraints.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "webhook-relay.componentSelectorLabels" $ctx | nindent 14 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: worker
+          image: {{ include "webhook-relay.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Same image as the api, different command. One image means the two
+          # can never drift to different versions of the shared store, queue
+          # and delivery code.
+          command: ["/app"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.worker.metricsPort }}
+              protocol: TCP
+          env:
+            {{- include "webhook-relay.commonEnv" . | nindent 12 }}
+            - name: WORKER_CONCURRENCY
+              value: {{ .Values.worker.concurrency | quote }}
+            - name: DRAIN_TIMEOUT
+              value: {{ .Values.worker.drainTimeout | quote }}
+            - name: METRICS_ADDR
+              value: ":{{ .Values.worker.metricsPort }}"
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          {{/*
+            The worker's readiness deliberately does NOT include the backlog
+            check the API has. A worker with a deep backlog is the thing
+            working on that backlog — removing it from service would only slow
+            recovery. It checks its dependencies and nothing else.
+          */}}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 3
+            failureThreshold: 20
+
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ .Values.lifecycle.preStopDelaySeconds }}
+
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi

@@ -1,0 +1,91 @@
+{{- if .Values.migrations.enabled }}
+{{/*
+  Schema migrations as a pre-upgrade hook.
+
+  WHY A HOOK AND NOT AN INIT CONTAINER
+  An initContainer runs once per pod. With two api replicas and two workers
+  that is four concurrent migration attempts on every rollout, all racing the
+  same schema. golang-migrate takes an advisory lock, so three of them block
+  and then find the work already done — but they block while the pod is in Init,
+  which delays the rollout, and a lock timeout surfaces as a mysterious
+  CrashLoopBackOff on a pod that has nothing wrong with it.
+
+  WHY PRE-UPGRADE AND NOT POST-INSTALL
+  The new code must never run against the old schema. A pre-upgrade hook
+  completes before any new pod is created, so the ordering is guaranteed rather
+  than hoped for.
+
+  THE FAILURE MODE THE LOCK PREVENTS
+  Without an advisory lock, two deploys overlapping — a rollback issued while a
+  rollout is still finishing, or ArgoCD retrying a failed sync — run `migrate
+  up` concurrently. Both read schema_migrations, both see version N, both apply
+  N+1. Depending on the statement that is either a duplicate-object error that
+  fails the deploy loudly, or, far worse, two ALTERs that both succeed and
+  leave the schema in a state no migration file describes. golang-migrate takes
+  a Postgres session advisory lock (pg_advisory_lock) for exactly this reason,
+  so the second process waits rather than proceeding.
+
+  The lock is held for the session, so if this pod is killed mid-migration the
+  lock is released by Postgres when the connection drops — no manual cleanup.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # A name that changes per revision. Helm hooks are not garbage-collected by
+  # default and a fixed name makes the second upgrade fail with "job already
+  # exists" — the delete policy below handles it, but a unique name also keeps
+  # the history of what ran when.
+  name: {{ include "webhook-relay.fullname" . }}-migrate-{{ .Release.Revision }}
+  labels:
+    {{- include "webhook-relay.componentLabels" (dict "root" . "component" "migrate") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    # Weight -5 so this runs before any other hook of the same phase.
+    "helm.sh/hook-weight": "-5"
+    # Keep a failed job for inspection; delete a successful one. Debugging a
+    # failed migration from a pod that was already deleted is miserable.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "webhook-relay.componentLabels" (dict "root" . "component" "migrate") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "webhook-relay.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: "{{ .Values.migrations.image.repository }}:{{ .Values.migrations.image.tag }}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            {{- include "webhook-relay.databaseUrlEnv" . | nindent 12 }}
+          # The migrate image's entrypoint is `migrate`; -verbose so a failure
+          # names the statement rather than just the version.
+          args:
+            - "-path=/migrations"
+            - "-database=$(DATABASE_URL)"
+            - "-verbose"
+            - "up"
+          volumeMounts:
+            - name: migrations
+              mountPath: /migrations
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: migrations
+          configMap:
+            name: {{ include "webhook-relay.fullname" . }}-migrations
+{{- end }}
