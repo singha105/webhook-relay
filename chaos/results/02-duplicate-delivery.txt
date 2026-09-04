@@ -1,45 +1,49 @@
 ------------------------------------------------------------
   RUN 1 of 2 - dedup DISABLED  (DELIVERY_DEDUP_ENABLED=false)
 ------------------------------------------------------------
-  endpoint 59d2fb44-638c-4cba-b8f5-9e7f6bc46ae8
-  posting 300 events...
-  in flight at kill time: null
-  KILL -9 the worker
-  worker restarted; waiting for the stale-claim reclaim...
+  endpoint f5d1e5aa-7621-4cc5-99f1-e1b3dbaf365e
+  [23:17:01Z] posting 400 events
+  [23:17:02Z] in flight at kill time: 10
+  [23:17:02Z] KILL -9 the worker
+  [23:17:05Z] worker restarted; waiting for the stale-claim reclaim
+  [23:19:50Z] all events reached a terminal state
 
-  events posted:                 300
-  deliveries the sink received:  300
-  distinct events at the sink:   292
-  DUPLICATE (event, attempt):    8
+  events posted:                 400
+  deliveries the sink received:  410
+  distinct events at the sink:   400
+  DUPLICATE (event, attempt):    10
 
   the duplicated pairs:
-    01a0683c-ccb9-74ae-b046-cec48225323d:1 delivered 2 times
-    01a0683c-ccd7-7d18-b0d3-dd1571d6c2c1:1 delivered 2 times
-    01a0683c-ccdb-7691-afe7-6cc345ac4b4e:1 delivered 2 times
-    01a0683c-cce6-7e39-b3c2-978520639331:1 delivered 2 times
-    01a0683c-ccea-7779-ae53-57750a45cc53:1 delivered 2 times
-    01a0683c-ccf2-7235-a12f-de2790be650c:1 delivered 2 times
-    01a0683c-cd29-78ae-9b18-c898804137a8:1 delivered 2 times
-    01a0683c-cd2f-7646-9701-24f925018719:1 delivered 2 times
+    01a06eb6-15bb-7496-b14e-070028300a38:1 delivered 2 times
+    01a06eb6-15bf-79f7-b4bc-a0b296484b3b:1 delivered 2 times
+    01a06eb6-15c0-75d0-ab62-c43ee372ef85:1 delivered 2 times
+    01a06eb6-15c6-725b-8f29-7e575c455432:1 delivered 2 times
+    01a06eb6-15c6-730e-b601-bb92af118d3f:1 delivered 2 times
+    01a06eb6-15cd-7e5f-af07-1f9c57245b46:1 delivered 2 times
+    01a06eb6-15dc-7463-a6d3-36cbe2d86c97:1 delivered 2 times
+    01a06eb6-15ef-7314-aa23-4cf233b71a5b:1 delivered 2 times
+    01a06eb6-15f2-7d91-8ee4-2035b586f90c:1 delivered 2 times
+    01a06eb6-15f7-74aa-a942-ffc3052e83d6:1 delivered 2 times
 
 ------------------------------------------------------------
   RUN 2 of 2 - dedup ENABLED  (DELIVERY_DEDUP_ENABLED=true)
 ------------------------------------------------------------
-  endpoint a9bbd436-1492-41fd-8dad-81f20c984063
-  posting 300 events...
-  in flight at kill time: null
-  KILL -9 the worker
-  worker restarted; waiting for the stale-claim reclaim...
+  endpoint 0b5452ad-5656-4b53-9d02-dce42934e021
+  [23:19:57Z] posting 400 events
+  [23:19:57Z] in flight at kill time: 10
+  [23:19:57Z] KILL -9 the worker
+  [23:20:00Z] worker restarted; waiting for the stale-claim reclaim
+  [23:23:01Z] all events reached a terminal state
 
-  events posted:                 300
-  deliveries the sink received:  300
-  distinct events at the sink:   300
+  events posted:                 400
+  deliveries the sink received:  400
+  distinct events at the sink:   400
   DUPLICATE (event, attempt):    0
 
 ------------------------------------------------------------
   RESULT
 ------------------------------------------------------------
-  dedup disabled -> 8 duplicate (event, attempt) pairs
+  dedup disabled -> 10 duplicate (event, attempt) pairs
   dedup enabled  -> 0 duplicate (event, attempt) pairs
 
   The guard is load-bearing: duplicates appear without it and vanish with it.
