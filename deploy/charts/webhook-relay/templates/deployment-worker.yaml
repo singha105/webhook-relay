@@ -81,10 +81,15 @@ spec:
         - name: worker
           image: {{ include "webhook-relay.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          # Same image as the api, different command. One image means the two
+          # Same image as the api, different binary. One image means the two
           # can never drift to different versions of the shared store, queue
           # and delivery code.
-          command: ["/app"]
+          #
+          # This said ["/app"] until Day 6, which is the image's DEFAULT
+          # entrypoint -- the api. So this Deployment ran a second copy of the
+          # API and delivered nothing. Naming the binary explicitly is what
+          # makes the comment above true.
+          command: ["/worker"]
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           ports:

@@ -15,8 +15,12 @@ resource "helm_release" "ingress_nginx" {
   create_namespace = true
   atomic           = true
   cleanup_on_fail  = true
-  timeout          = 600
-
+  # Raised from 600 on Day 6. On a laptop with Docker capped at ~5 GiB, image
+  # pulls and scheduling on a cold cluster routinely exceed the old value, and
+  # atomic = true then UNINSTALLS a release whose pods were already Running --
+  # so bootstrap failed while the cluster was in the middle of coming up
+  # correctly. A generous timeout costs nothing when things are fast.
+  timeout = 1800
   values = [yamlencode({
     controller = {
       # DaemonSet with hostPort, not a LoadBalancer Service: k3d's own

@@ -16,8 +16,12 @@ resource "helm_release" "chaos_mesh" {
 
   atomic          = true
   cleanup_on_fail = true
-  timeout         = 900
-
+  # Raised from 900 on Day 6. On a laptop with Docker capped at ~5 GiB, image
+  # pulls and scheduling on a cold cluster routinely exceed the old value, and
+  # atomic = true then UNINSTALLS a release whose pods were already Running --
+  # so bootstrap failed while the cluster was in the middle of coming up
+  # correctly. A generous timeout costs nothing when things are fast.
+  timeout = 1800
   values = [yamlencode({
     chaosDaemon = {
       # k3s uses containerd, and the daemon needs its socket to enter a

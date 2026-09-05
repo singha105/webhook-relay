@@ -104,6 +104,9 @@ spec:
         - name: api
           image: {{ include "webhook-relay.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Explicit, for the same reason as the worker: the image carries
+          # both binaries and the Deployment declares which role it is.
+          command: ["/api"]
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           ports:

@@ -24,8 +24,12 @@ resource "helm_release" "kube_prometheus_stack" {
   cleanup_on_fail = true
   # The stack installs a large CRD set and several components; the default
   # 5-minute timeout expires on a cold laptop before Prometheus is ready.
-  timeout = 900
-
+  # Raised from 900 on Day 6. On a laptop with Docker capped at ~5 GiB, image
+  # pulls and scheduling on a cold cluster routinely exceed the old value, and
+  # atomic = true then UNINSTALLS a release whose pods were already Running --
+  # so bootstrap failed while the cluster was in the middle of coming up
+  # correctly. A generous timeout costs nothing when things are fast.
+  timeout = 2400
   values = [yamlencode({
     # ----------------------------------------------------------------------
     # Prometheus
