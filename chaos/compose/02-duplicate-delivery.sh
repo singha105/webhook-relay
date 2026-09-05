@@ -15,6 +15,10 @@
 #
 set -euo pipefail
 
+# Timestamped output. The postmortem needs a real timeline, and a timeline
+# reconstructed after the fact is a guess with punctuation.
+ts() { printf '  [%s] %s\n' "$(date -u '+%H:%M:%SZ')" "$*"; }
+
 API="${API_URL:-http://localhost:8090}"
 SINK_CTL="${SINK_URL:-http://localhost:9091}"
 SINK_TARGET="${SINK_TARGET:-http://sink:9090/hook}"
@@ -65,7 +69,7 @@ run_once() {
       | jq -r .id)
   echo "  endpoint ${ep}"
 
-  echo "  posting ${EVENTS} events..."
+  ts "posting ${EVENTS} events"
   for i in $(seq 1 "$EVENTS"); do
     curl -fsS -o /dev/null -X POST "$API/v1/events" -H 'Content-Type: application/json' \
       -d "{\"endpoint_id\":\"${ep}\",\"event_type\":\"dup.test\",\"payload\":{\"n\":${i}}}" &
@@ -78,15 +82,15 @@ run_once() {
     [ "$(curl -fsS "$SINK_CTL/_control/stats" | jq -r '.in_flight')" -gt 0 ] && break
     sleep 0.5
   done
-  echo "  in flight at kill time: $(curl -fsS "$SINK_CTL/_control/stats" | jq -r '.in_flight')"
+  ts "in flight at kill time: $(curl -fsS "$SINK_CTL/_control/stats" | jq -r '.in_flight')"
 
-  echo "  KILL -9 the worker"
+  ts "KILL -9 the worker"
   # SIGKILL, not SIGTERM: a graceful stop drains, which is the case Day 3
   # already covers. This is the ungraceful one.
   docker kill --signal=KILL "$($COMPOSE ps -q worker)" >/dev/null 2>&1 || true
   sleep 2
   $COMPOSE up -d --no-deps worker >/dev/null 2>&1
-  echo "  worker restarted; waiting for the stale-claim reclaim..."
+  ts "worker restarted; waiting for the stale-claim reclaim"
 
   # The reclaim only happens after STALE_CLAIM_TIMEOUT (60s by default), so
   # this genuinely has to wait it out.
@@ -105,6 +109,7 @@ run_once() {
   distinct=$(echo "$stats" | jq -r '.distinct_events')
   dupes=$(echo "$stats" | jq -r '.duplicate_sends | length')
 
+  ts "all events reached a terminal state"
   echo ""
   echo "  events posted:                 ${EVENTS}"
   echo "  deliveries the sink received:  ${total}"

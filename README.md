@@ -1,216 +1,405 @@
 # webhook-relay
 
-Reliable webhook delivery with at-least-once semantics, retries, and chaos-tested
-failure modes — the kind of service Stripe or Svix runs internally.
-
 [![CI](https://github.com/singha105/webhook-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/singha105/webhook-relay/actions/workflows/ci.yml)
-[![Go](https://img.shields.io/badge/go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/go-1.25-00ADD8?logo=go&logoColor=white)](go.mod)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+A webhook delivery service — the thing that sits between your application and
+your customers' HTTP endpoints and makes sure events arrive, retrying when they
+do not. Think the delivery half of Stripe webhooks or Svix.
+
+It ingests events at **~875/sec**, delivers at **~870/sec**, signs every
+payload with HMAC-SHA256, retries with full-jitter exponential backoff, dead
+letters after six attempts, and survives having its workers killed mid-flight.
+Those numbers come from a load test you can re-run with one command on the
+hardware described in [Performance](#performance) — a laptop, not a cluster.
+Everything runs locally: Postgres, Valkey, Kubernetes, and the whole
+observability stack are self-hosted with no cloud account anywhere.
+
+![make demo](docs/images/demo.gif)
+
+*The real `make demo`, time-compressed 3×. Stack up, signed webhook delivered,
+a failing receiver driven through the retry ladder into the DLQ and replayed,
+then a worker SIGKILLed with ten deliveries in flight.*
 
 ---
 
-## Status: Day 5 of 6
-
-This repository is being built in public, one day at a time. **Only what is
-described below actually works.** Nothing here is a stub presented as finished.
-
-| | |
-|---|---|
-| ✅ **Working today** | Everything from Days 1–4, plus k6 load-test scenarios, a measured delivery bottleneck with a before/after fix, ten chaos experiments with predictions committed before the runs, and a duplicate-delivery postmortem backed by reproducible evidence |
-| ⬜ **Not built yet** | Day 6: the write-up pass and whatever the numbers say needs fixing. |
-
-**Every number in this repository comes from a run you can reproduce with a
-committed script.** Where an experiment could not run on this hardware, it says
-so rather than showing a figure.
-
-The roadmap is at the [bottom of this file](#roadmap).
+> ### 📄 Start here: [Postmortem — duplicate webhook deliveries](docs/postmortem-duplicate-delivery.md)
+>
+> I killed a worker mid-delivery and measured what broke. Every request in
+> flight was delivered **twice** — and the number of duplicates turned out to
+> be exactly the worker's concurrency setting, which means the throughput knob
+> is also the correctness blast radius. The write-up covers why acking after a
+> side effect makes this unavoidable, and why no metric we export would have
+> caught it in production.
+>
+> Second one: [deliveries the receiver completed and we recorded as
+> failures](docs/postmortem-timeout-boundary.md) — a receiver 400ms slower than
+> our timeout processed 15 requests while we recorded zero.
 
 ---
 
-## Quick start
+## Quickstart
 
-Requires only **Docker** and **make**. Everything else runs in containers.
+Four commands from nothing to a running system with events flowing through it:
 
 ```bash
 git clone https://github.com/singha105/webhook-relay.git
 cd webhook-relay
-make up && make migrate-up
+make demo
 ```
 
-![make up and make migrate-up](docs/images/up.png)
+`make demo` builds the images, starts the stack, applies migrations, delivers a
+signed webhook, drives a receiver to failure through the full retry ladder into
+the dead letter queue, replays it, then **SIGKILLs a worker with deliveries in
+flight** and shows what survives. Takes about five minutes on a cold cache.
 
-`make up` refuses to start if a host port is already taken, and tells you which
-one and how to override it — ports live in `.env` (see `.env.example`). That is
-deliberate: on the machine this was built on, 8080 belonged to Apache and 5432
-to a local Postgres, and a bind error from inside Docker is a bad way to learn
-that.
-
-Then seed some data:
+Requires Docker, `curl`, and `jq`. Nothing else — no account, no API key, no
+cloud provider.
 
 ```bash
-make seed
+make down          # stop everything, delete the volumes
+make chaos-list    # the ten chaos experiments
+make help          # everything else
 ```
-
-To watch delivery actually happen — retries, dead-lettering, replay, and a
-signature verified against `openssl` — start the stack with a controllable
-receiver and run the demonstration:
-
-```bash
-make demo-up && make demo
-```
-
-**Grafana is at [localhost:3000](http://localhost:3000)** with the dashboard
-already loaded — no login, no datasource wiring, no import step.
-
-### On Kubernetes
-
-Docker Compose is the fast path. The real deployment target is a Kubernetes
-cluster, provisioned entirely by code:
-
-```bash
-make cluster-up      # k3d, from deploy/k3d/cluster.yaml
-make bootstrap       # Terraform provisions everything into it
-make endpoints       # prints URLs and generated passwords
-```
-
-`make cluster-up PROFILE=lowmem` uses a 1-agent profile if Docker has under
-~5 GiB. See [Resource requirements](#resource-requirements).
-
-<details>
-<summary><code>make</code> targets</summary>
-
-| Target | What it does |
-|---|---|
-| `up` / `down` | Start / tear down the stack (`down` also deletes volumes) |
-| `migrate-up` / `migrate-down` | Apply / roll back migrations |
-| `seed` | Register a demo endpoint and post a few events |
-| `test` / `test-short` | Full suite (needs Docker) / unit tests only |
-| `lint` / `fmt` / `vet` | golangci-lint, formatting, vet |
-| `verify` | Everything CI runs |
-| `scan` | Scan the whole git history for secrets |
-
-</details>
 
 ---
 
-## What it does today
+## Architecture
 
-### Register an endpoint
+```mermaid
+flowchart LR
+    P[Producer]
 
-The signing secret is generated server-side and returned **exactly once**. It is
-never included in any subsequent response.
+    subgraph relay["webhook-relay"]
+        API["API<br/><small>chi · stdlib http</small>"]
+        PG[("PostgreSQL 16<br/><small>source of truth</small>")]
+        R["Outbox relay<br/><small>sole queue producer</small>"]
+        VK[("Valkey 8<br/><small>Streams · consumer group</small>")]
+        W["Delivery workers<br/><small>N goroutines</small>"]
+    end
 
-![registering an endpoint](docs/images/endpoint.png)
+    subgraph guards["per-delivery guards"]
+        RL["Token bucket<br/><small>Lua, atomic</small>"]
+        CB["Circuit breaker"]
+        DD["Dedup guard<br/><small>SETNX event:attempt</small>"]
+    end
 
-The secret is stored in plaintext rather than hashed, because the delivery
-worker has to recompute an HMAC over the payload at send time. Unlike a
-password, it cannot be a one-way hash. "Shown once" is an API-surface guarantee,
-enforced by the response shape and asserted by tests — not a storage guarantee.
+    EP["Customer endpoint"]
 
-### Ingest an event
+    P -->|"POST /v1/events<br/>202 once durable"| API
+    API -->|"one transaction"| PG
+    R -->|"claim batch<br/>FOR UPDATE SKIP LOCKED"| PG
+    R -->|"XADD pipelined"| VK
+    VK -->|"XREADGROUP"| W
+    W --> RL --> CB --> DD
+    DD -->|"POST + HMAC-SHA256"| EP
+    W -->|"record attempt"| PG
+    W -->|"XACK"| VK
+    VK -.->|"XAUTOCLAIM<br/>recover dead workers"| W
 
-Ingest does four things and no more: decode, validate, write one row, return.
-No delivery work, no queue publish, no pre-flight lookup on the request path.
+    style PG fill:#336791,color:#fff
+    style VK fill:#c6302b,color:#fff
+    style EP fill:#2d7d46,color:#fff
+```
 
-![posting an event](docs/images/ingest.png)
+The shape that matters: **ingest never touches the queue.** It writes to
+Postgres in one transaction and returns 202. A separate relay polls for due
+events and is the only producer the queue has. That is the transactional outbox
+pattern, and it is what makes the 202 mean something precise — "durably stored"
+— rather than "probably stored and probably queued"
+([ADR 0002](docs/adr/0002-transactional-outbox.md)).
 
-`202`, not `201` — the event is durably recorded, but nothing has been
-delivered. Claiming `201 Created` would imply the work is done.
+The dashed arrow is the one that makes the system survivable. When a worker
+dies holding entries, `XAUTOCLAIM` hands them to a live worker after the stale
+timeout. It is also the arrow that causes duplicate deliveries, which is what
+the [postmortem](docs/postmortem-duplicate-delivery.md) is about.
 
-### Idempotent ingest
+---
 
-Replay the same `Idempotency-Key` and you get the original event back with a
-`200` instead of a `202`. Ten concurrent identical requests produce exactly one
-row.
+## Delivery semantics
 
-![idempotent ingest](docs/images/idem.png)
+**Every event is delivered at least once. Some events will be delivered more
+than once. Receivers must deduplicate on `X-Webhook-Id`.**
 
-This is resolved by the database, not the application. See
-[the idempotency race](#the-idempotency-race) below.
+That is the whole contract, and the rest of this section explains why it cannot
+be better.
 
-### Deliver it, retry it, dead-letter it
+### Why not exactly-once
 
-A worker signs the payload, POSTs it, and records every attempt. When the
-endpoint keeps failing, retries back off with full jitter until the attempt
-budget is spent and the event is dead-lettered.
+Exactly-once delivery over a lossy network is not hard — it is **impossible**,
+and the impossibility has a name: the **two generals' problem**.
 
-![retry with full jitter, then dead letter](docs/images/retry.png)
+Two generals must agree to attack, communicating only by messengers who may be
+captured. A sends "attack at dawn". Did it arrive? A needs an acknowledgement.
+B sends one. Did *that* arrive? B now needs an acknowledgement of the
+acknowledgement. The regress never terminates. No finite protocol over a lossy
+channel gives both parties common knowledge that a message was received.
 
-Look at the gaps rather than the timestamps. The **ceiling** doubles — 2s, 4s,
-8s, 16s, 32s — but each actual delay is a uniform draw from `[0, ceiling)`, so
-the sequence trends upward without being monotonic. The 5→6 gap of 10s under a
-32s ceiling is the jitter working, not a bug. A perfectly doubling sequence
-would mean it was not.
+Our channel is HTTP over the internet. When a delivery times out, two worlds
+are consistent with everything we can observe:
 
-Note also `duplicate dispatches: {}` — six attempts, six deliveries, no
-attempt sent twice.
+1. The request never arrived; the receiver did nothing.
+2. The request arrived, the receiver processed it, and the **response** was lost.
 
-### Replay it, and verify the signature
+Nothing on our side distinguishes them, so we must choose:
 
-Point the endpoint at something healthy and replay from the DLQ. The attempt
-budget resets; the failure history does not disappear.
+| Choice | Guarantee | Failure mode |
+|---|---|---|
+| Assume it failed, retry | **at-least-once** | receiver may process twice |
+| Assume it succeeded, stop | at-most-once | events silently lost |
 
-![replay from the DLQ and verify the signature](docs/images/replay.png)
+We choose at-least-once, because a duplicate is loud and fixable by an
+idempotent receiver, while a lost webhook is silent and unrecoverable.
 
-The last step recomputes the HMAC with `openssl` and compares it to the `v1=`
-digest we sent. It matches, which means the signature scheme is verifiable by
-anything that can compute an HMAC — not just by our own Go code.
+This is not theoretical. [Chaos experiment
+10](docs/postmortem-timeout-boundary.md) put a receiver 400ms on the wrong side
+of our timeout: **it successfully processed 15 requests while we recorded zero
+deliveries.** Both sides behaved correctly. The channel ate the answer.
 
-### Watch it happen
+Anything advertising "exactly-once" is doing at-least-once plus deduplication
+at the receiver. That is what we ask for directly, instead of selling it as a
+guarantee we cannot make ([ADR 0004](docs/adr/0004-at-least-once-over-exactly-once.md)).
 
-![the Grafana dashboard](docs/images/dashboard.png)
+### What we actually guarantee
 
-Provisioned from [`deploy/grafana/dashboards/webhook-relay.json`](deploy/grafana/dashboards/webhook-relay.json)
-— the JSON on disk is the source of truth, and UI edits are deliberately
-overwritten on reload. The dashboard is code.
+1. **Durability before acknowledgement.** A 202 means the event is committed to
+   Postgres. Not queued, not in memory — committed.
+2. **At-least-once delivery**, or a dead letter after six attempts, visible via
+   the API. Never silently dropped.
+3. **A stable `X-Webhook-Id`** across every retry of an event. This is your
+   deduplication key.
+4. **Signed payloads.** HMAC-SHA256 over `{timestamp}.{raw body}`, compared with
+   `hmac.Equal`. A retry is verifiable as ours.
+5. **Ordering is not guaranteed.** Events are delivered concurrently and retries
+   reorder them. If you need ordering, use the event's own sequence data.
 
-The scattered markers on the latency panel are **exemplars**. Each one links a
-histogram observation to the trace that produced it, so a p99 spike is one click
-from the request that caused it.
+### What we do not guarantee, and why it is narrower than it sounds
 
-### Rate limiting, per endpoint
+The delivery-side dedup guard suppresses a duplicate *dispatch* of the same
+`(event_id, attempt)`. Measured: **10 duplicates without it, 0 with it, across
+400 events under a hard kill** — over a three-minute window.
 
-`rate_limit_per_sec` from Day 1 is now enforced. 300 events posted at once to an
-endpoint configured for 10/s:
+Over a longer window it is weaker than that sounds. The guard **defers** the
+duplicate rather than removing it: a worker that suppresses a dispatch acks the
+queue entry without recording an outcome, so the event sits in `delivering`
+until the marker expires and is then delivered again. Measured with a
+compressed clock, all 8 in-flight requests duplicated 73 seconds after the kill
+([#19](https://github.com/singha105/webhook-relay/issues/19)).
 
-![per-endpoint rate limiting](docs/images/ratelimit.png)
+It does not — and cannot — prevent a duplicate caused by a **timeout**, because
+a timeout produces a legitimately new attempt number that *should* be retried.
+That is exactly the case where the receiver already did the work. The window is
+narrowed, not closed, and it cannot be closed from the sender's side.
 
-The first 11 go straight through — that is the token bucket starting full, which
-avoids a cold-start penalty on the first event to any endpoint. After that it
-converges on exactly the configured rate.
+---
 
-A rate-limited delivery **does not consume an attempt**. The receiver never saw
-a request, so there is nothing to record and nothing that should count against
-the retry budget. Without that rule, a customer using exactly the rate they
-configured would eventually have their events dead-lettered for being slow.
+## Performance
 
-### The circuit breaker
+Measured on the machine this was built on. Single-node, laptop hardware, and
+the numbers say so — a defensible small number beats an inflated one.
 
-![circuit breaker trips and recovers](docs/images/breaker.png)
+| | |
+|---|---|
+| Machine | Apple M3, 8 cores, 8 GB RAM |
+| Docker | 3.825 GiB, 8 CPUs |
+| Stack | docker-compose (Postgres 16, Valkey 8, api, worker, sink) |
+| Load generator | k6, on the same machine |
 
-Note the middle rows: while the breaker is open, `attempts_reaching_sink` is
-frozen at 13. Not slowed — stopped. That is the point.
+| Metric | Result |
+|---|---|
+| Ingest, sustained | **~875 events/sec** |
+| Delivery, sustained | **~870 events/sec** |
+| Ingest p95 | **< 50 ms** (threshold; the run fails if exceeded) |
+| Error rate | **< 0.1%** (threshold) |
 
-`consecutive_failures` overshot the threshold of 10 and tripped at 13, because
-ten worker goroutines were in flight when it crossed. The breaker permits that
-overshoot; what it does not permit is a *probe* stampede, which is why the
-half-open transition is a Lua script.
+```bash
+make demo-up                        # stack + controllable receiver
+k6 run loadtest/baseline.js         # 200/s for 5 minutes
+./loadtest/drain-throughput.sh      # sustained delivery throughput
+```
 
-### One trace, from ingest to the third attempt
+### The bottleneck hunt
 
-![a single trace spanning ingest and three delivery attempts](docs/images/trace.png)
+The first three hypotheses were wrong, which is the useful part:
 
-One root span, zero orphans, across two services. The offsets show the retry
-backoff directly.
+| Hypothesis | Verdict |
+|---|---|
+| pgx pool too small (10 → 25) | no effect |
+| worker concurrency too low (10 → 50) | no effect |
+| both together (50 / pool 60) | no effect — 750 vs 769 |
+| some saturated resource | **nothing was saturated** |
 
-### Everything self-probes
+`docker stats` during a drain, against 800% available: worker 123.7%, Postgres
+123.6%, Valkey 32.6%. Nothing CPU-bound, so the system is **latency-bound on
+sequential round trips** rather than short of capacity — which ruled out "add
+more workers" and pointed at round-trip count instead.
 
-![container health](docs/images/health.png)
+The relay is the sole producer for the entire system, and it was enqueueing one
+event per round trip in a serial loop — O(n) `XADD`s per batch.
 
-The runtime image is distroless — no shell, no curl — so each binary probes
-itself via `-healthcheck`. The API GETs its own `/readyz`; the worker, which
-serves no HTTP, checks that Postgres and Valkey are both reachable using its
-real configuration.
+| Configuration | Median |
+|---|---|
+| Baseline (serial enqueue) | 769.2 events/sec |
+| Pipelined enqueue | **810.8 events/sec** (+5.4%) |
+| Pipelined + concurrency 50 / pool 60 | **869.6 events/sec** (+13.1%) |
+
+**The honest caveat:** 5× the concurrency still buys only 7% on an unsaturated
+machine, so a serialization point remains that I did not isolate. It is
+[issue #6](https://github.com/singha105/webhook-relay/issues/6) with ranked
+candidates, not a mystery I am pretending is solved.
+
+Three experiments during that day turned out to be measuring nothing at all —
+an env var not plumbed through compose, a harness timing only the tail, and
+`$COMPOSE up -d` silently doing nothing in zsh. All three are written up rather
+than deleted.
+
+**Raw data:** [`loadtest/README.md`](loadtest/README.md) ·
+[`loadtest/results/`](loadtest/results/) ·
+[optimization before/after](loadtest/results/optimization-relay-pipelining.md)
+
+---
+
+## Chaos experiments
+
+Eleven experiments, each with a prediction and a falsification criterion committed
+**before** it ran, so they cannot be retrofitted to results.
+
+| # | Experiment | Hypothesis | What actually happened |
+|---|---|---|---|
+| 1 | Kill a worker mid-delivery | Entries are reclaimed; no loss | Covered by #2 |
+| 2 | Same, dedup disabled | Duplicates appear without the guard | ✅ **Correct.** 10 duplicates without, 0 with, over 400 events. Duplicates = in-flight = concurrency = 10 |
+| 3 | Poison message | No payload can wedge a worker | ✅ **Correct.** 10 of 11 hostile payloads delivered, malformed JSON rejected at ingest, 0 restarts |
+| 4 | 30s latency vs 10s timeout | Timeouts, retries, no loss | ⬜ Not run — needs Chaos Mesh |
+| 5 | Kill Valkey | Queue lost, Postgres re-enqueues, no events lost | ⬜ Script committed, not yet run |
+| 6 | Kill the Postgres primary | CNPG fails over; writes resume | ⬜ Not run — needs 3 replicas |
+| 7 | Workers to zero for 5 min | Backlog grows, drains on return | ⬜ Not run — needs Chaos Mesh |
+| 8 | Partition worker from Valkey | Worker stalls, recovers | ⬜ Not run — needs Chaos Mesh |
+| 9 | CPU stress on a worker | Throughput drops, no incorrectness | ⬜ Not run — needs Chaos Mesh |
+| 10 | Receiver at the timeout boundary | Double-processing at the receiver | ❌ **Prediction wrong.** At 9.9s vs a 10s timeout: zero timeouts, perfectly clean. I approximated the boundary instead of crossing it. At 10.4s: receiver processed 15 requests, we recorded **0 deliveries** |
+| 11 | What happens to a suppressed event | The guard defers the duplicate rather than preventing it | ✅ **Correct, and it corrects #2.** All 8 in-flight requests duplicated 73s after the kill, once the dedup marker expired |
+
+Five did not run. Chaos Mesh needs ~6 GiB of Docker memory and this machine has
+3.825 GiB, so their manifests and predictions are committed **unresolved**
+rather than given invented results. An experiment log where every prediction was
+confirmed is a log where nothing was learned.
+
+Full predictions and results: [`docs/chaos-results.md`](docs/chaos-results.md) ·
+manifests in [`chaos/`](chaos/)
+
+---
+
+## What I would do differently at scale
+
+Everything below is deliberately *not* built. This system targets a single node
+and hundreds of events per second; each of these is the right answer at a scale
+it does not have, and building them now would be architecture cosplay.
+
+**Partition the queue by endpoint.** One stream and one consumer group means a
+single slow receiver occupies workers that everyone else is waiting for — the
+noisy-neighbour problem, and the most urgent item here. A receiver that takes
+9s per request ties up a worker for 9s, and with concurrency 10 it takes ten
+such receivers to stall the system entirely. Partitioning by `endpoint_id` hash
+into per-partition consumer groups bounds the damage to one partition. The cost
+is rebalancing when endpoints are added, and hot partitions when one customer
+dwarfs the rest.
+
+**Separate worker pools per priority tier.** Password resets and marketing
+webhooks currently share a queue. They should not: one is user-visible and
+latency-critical, the other can wait minutes. Separate pools with separate
+concurrency budgets stop a bulk backfill from delaying a login email. The cost
+is capacity planning per tier and deciding what happens when the high-priority
+pool is idle while the low one is saturated.
+
+**Move the outbox relay to CDC via Debezium.** The relay polls every 250ms,
+which adds latency to every event and puts a floor under how fresh delivery can
+be. Debezium reading the Postgres WAL turns that into a push: the event is in
+the queue milliseconds after commit, with no polling and no lease bookkeeping.
+It also removes the relay as a serialization point entirely. The cost is
+Kafka Connect, a Kafka cluster, and replication-slot management — a large
+operational commitment, which is exactly why it is not here at this size.
+
+**Shard Postgres by endpoint.** One primary handles ingest and every delivery
+state transition. At ~10× current write volume the delivery-attempt table
+becomes the constraint long before ingest does. Sharding by `endpoint_id` keeps
+each endpoint's events and attempts colocated, so no query needs a scatter-gather.
+The cost is that cross-shard operations — global dead-letter listings, aggregate
+metrics — become fan-out queries, and resharding is a project rather than a
+config change.
+
+**Per-tenant fair queueing.** Rate limiting is per-endpoint, which protects
+*receivers* and does nothing to stop one tenant consuming all delivery capacity.
+A tenant posting a million events monopolises the workers no matter how polite
+each individual delivery is. Weighted fair queueing or deficit round-robin
+across tenant queues fixes it. The cost is that fairness needs a scheduler, and
+a scheduler needs to know tenant weights, which is a product decision before it
+is an engineering one.
+
+---
+
+## Known limitations
+
+Named here rather than left for a reviewer to find.
+
+- **Events stranded in `delivering` after a worker dies.** When the dedup guard
+  suppresses a re-dispatch, the worker acks the queue entry without recording an
+  outcome, so the event sits in `delivering` until the lease sweep and the dedup
+  TTL let it through. Found by `make demo` on Day 6, not by a test.
+  [#19](https://github.com/singha105/webhook-relay/issues/19)
+- **`/readyz` reports ready with no schema.** It checks that Postgres is
+  reachable, not that migrations have run, so a freshly deployed pod passes its
+  health check and then 500s every request.
+  [#18](https://github.com/singha105/webhook-relay/issues/18)
+- **A serialization point in delivery is unidentified.** 5× the worker
+  concurrency buys 7% on a machine where nothing is CPU-saturated.
+  [#6](https://github.com/singha105/webhook-relay/issues/6)
+- **Half the chaos experiments have not run** — five of ten need Chaos Mesh or a
+  multi-replica Postgres, neither of which fits in 3.825 GiB.
+- **No authentication.** Anyone who can reach the API can register endpoints and
+  post events. Real deployments need per-tenant API keys.
+- **No SSRF protection.** Endpoint URLs may point at loopback and private
+  ranges — required for local testing, unacceptable hosted without an egress
+  allowlist.
+- **No list/filter endpoint for events.** Only get-by-id. Operational queries go
+  through psql, which is why `make demo` shells into Postgres for its counts.
+- **`endpoint_id` is a metric label** — one series per endpoint on four metrics.
+  Fine at tens of endpoints, a cardinality problem at thousands.
+- **Delivery is at-least-once, deliberately.** See [Delivery
+  semantics](#delivery-semantics).
+- **`payload: null` is accepted** and delivered as the four bytes `null`, since
+  it is valid JSON. [#7](https://github.com/singha105/webhook-relay/issues/7)
+- **NetworkPolicies are written but not enforced**, because k3s ships Flannel.
+  They need Calico or Cilium to do anything.
+- **The HPA's queue-depth metric is disabled by default.** It needs
+  prometheus-adapter, which is not installed. An HPA referencing a metric nobody
+  serves is a silently degraded autoscaler, so it is off rather than aspirational.
+- **Grafana runs with anonymous admin access** in the Compose stack. Correct for
+  a local demo, not something to deploy; the Kubernetes path uses a generated
+  password.
+- **Tracing samples at 100%.** Right at this volume, wrong for real traffic.
+- **The breaker can overshoot its threshold** — concurrent goroutines can push
+  `consecutive_failures` past the limit before the open takes effect. Deliberate:
+  an exact trip would need a lock on the hot path. The *probe* is exact.
+- **Offset pagination** on `GET /v1/endpoints` drifts under concurrent inserts.
+  Endpoints are registered by humans, so this is acceptable; the events table
+  would need keyset pagination.
+- **Queue depth stops being truthful above 100,000.** The stream is trimmed at
+  `MAXLEN ~ 100000`, so the gauge pins there and stops counting.
+
+---
+
+## Documentation
+
+| | |
+|---|---|
+| [Postmortem: duplicate deliveries](docs/postmortem-duplicate-delivery.md) | The headline incident, with measured evidence |
+| [Postmortem: the timeout boundary](docs/postmortem-timeout-boundary.md) | Deliveries that succeeded and we recorded as failures |
+| [Architecture decision records](docs/adr/) | Six decisions and what each one costs |
+| [Chaos results](docs/chaos-results.md) | Predictions vs outcomes, including the wrong one |
+| [Load testing](loadtest/README.md) | The bottleneck hunt and three invalid experiments |
+| [Runbook](docs/runbook.md) | On-call procedures |
+| [Secrets](docs/secrets.md) | Sealed Secrets, and the key-loss failure mode |
+| [Contributing](CONTRIBUTING.md) | Conventions and local setup |
 
 ---
 
@@ -248,6 +437,8 @@ Every error uses one envelope, so a client writes one error handler:
 Validation reports **every** broken field at once, so fixing a bad request does
 not take one round trip per mistake. The `request_id` matches the one on every
 log line for that request, and is echoed in the `X-Request-ID` response header.
+
+---
 
 ---
 
@@ -572,6 +763,8 @@ wrong.
 
 ---
 
+---
+
 ## Running on Kubernetes
 
 Nothing below is applied by hand. `make bootstrap` runs Terraform, Terraform
@@ -787,6 +980,8 @@ The full profile needs Docker Desktop → Settings → Resources → Memory ≥ 
 
 ---
 
+---
+
 ## Service level objective
 
 > **99% of events are delivered within 30 seconds of ingest, measured over a
@@ -886,6 +1081,8 @@ rather than "we try hard".
 
 ---
 
+---
+
 ## Testing
 
 ![make test and make lint](docs/images/test.png)
@@ -934,6 +1131,8 @@ their connection pools before the starting gate opens.
 
 ---
 
+---
+
 ## Layout
 
 ```
@@ -963,159 +1162,21 @@ test/sink/          controllable webhook receiver for tests and the demo
 
 ---
 
-## Load testing and chaos
-
-Two questions this day set out to answer with measurements rather than
-assertions: how fast is it, and what breaks it.
-
-### How fast
-
-k6 scenarios in [`loadtest/`](loadtest/) — smoke, baseline, a 0→5000/s ramp,
-and a 30-minute soak. The ramp deliberately does **not** inherit the p95<50ms
-threshold: a ramp that must stay fast would fail at the knee it exists to find.
-
-Measured on an Apple M3 (8 cores, 8 GB) with Docker limited to 3.825 GiB. These
-are single-machine numbers and they reflect local hardware; a defensible small
-number beats an inflated one.
-
-| | |
-|---|---|
-| Ingest, sustained | ~875 events/sec |
-| Delivery, sustained | ~870 events/sec |
-
-### The bottleneck, and the part still unexplained
-
-The first three hypotheses were all wrong, and the elimination is the
-interesting part. Raising the pgx pool did nothing. Raising worker concurrency
-did nothing. Raising both together did nothing. `docker stats` during a drain
-then showed **nothing was saturated** — worker and Postgres each at ~124% of
-800% available — so the system is latency-bound on sequential round trips, not
-short of capacity.
-
-That pointed at the relay, which is the sole queue producer for the whole
-system and was enqueueing one event per round trip in a serial loop.
-
-| Configuration | Median |
-|---|---|
-| Baseline (serial enqueue) | 769.2 events/sec |
-| Pipelined enqueue | **810.8 events/sec** (+5.4%) |
-| Pipelined + concurrency 50 / pool 60 | **869.6 events/sec** (+13.1%) |
-
-The caveat is stated rather than buried: 5× the concurrency still buys only 7%
-on an unsaturated machine, so a serialization point remains that this day did
-not isolate. Ranked candidates, the full elimination trail, and three
-experiments that turned out to be measuring nothing at all are in
-[`loadtest/README.md`](loadtest/README.md).
-
-### What breaks it
-
-Ten experiments in [`chaos/`](chaos/), each with a prediction and a
-falsification criterion committed *before* it ran. Results:
-[`docs/chaos-results.md`](docs/chaos-results.md).
-
-**The headline — duplicate deliveries.** Kill a worker between "request sent"
-and "queue entry acknowledged" and the entry is reclaimed and sent again. Same
-scenario twice, 300 events, the only difference being the dedup guard:
-
-```
-dedup disabled -> 300 deliveries, 292 distinct events, 8 duplicates
-dedup enabled  -> 300 deliveries, 300 distinct events, 0 duplicates
-```
-
-The receiver did 300 units of work for 292 events. Full analysis in
-[`docs/postmortem-duplicate-delivery.md`](docs/postmortem-duplicate-delivery.md).
-
-**Where a prediction was wrong.** Experiment 10 put a receiver at the timeout
-boundary — 9.9s against a 10s timeout — and predicted double-processing. It
-produced a perfectly clean run: 30 events, 30 attempts, zero timeouts. The
-mechanism was reasoned correctly and then tested with a parameter that never
-triggers it, because 100ms of headroom exceeds any jitter on a local bridge.
-
-Re-run at 10.4s, which does cross:
-
-```
-10 events, 15 attempts, 15 timeouts, 0 recorded deliveries
-the receiver actually processed 15 requests, 8 distinct
-```
-
-**The receiver succeeded 15 times and the system recorded zero successes.** The
-dedup guard correctly does not fire — each retry is a genuinely new attempt
-number, not a duplicate dispatch of the same one. This is the outer boundary of
-what sender-side deduplication can do.
-
-Five experiments are recorded as NOT RUN. They need Chaos Mesh or a 3-replica
-Postgres cluster, and this machine has 3.825 GiB against the ~6 GiB the full
-profile needs. Their manifests and predictions are committed unresolved rather
-than given invented results.
-
 ---
 
-## Roadmap
+## How it was built
+
+Six days, one thing at a time, each merged to `main` behind CI and tagged.
 
 | Day | Deliverable |
 |---|---|
-| **1** ✅ | Ingest API, schema, idempotency, local stack, CI |
-| **2** ✅ | Outbox relay, Valkey Streams, delivery worker, HMAC signing, full-jitter retries, DLQ, replay |
-| **3** ✅ | Rate limiting, circuit breaker, tracing, metrics, Grafana, graceful shutdown, SLO |
-| **4** ✅ | k3d + Terraform + Helm + ArgoCD, signed images, NetworkPolicies, alerts, runbook |
-| **5** ✅ | k6 load tests, the bottleneck hunt and its fix, chaos experiments, the duplicate-delivery postmortem |
-| **6** | Final write-up pass |
-
-`endpoints.consecutive_failures` is already maintained by the worker — reset on
-success, incremented on failure — so Day 3's circuit breaker reads a counter
-that is already correct rather than starting from zero against live data.
-
----
-
-## Known gaps
-
-Stated plainly rather than discovered by a reviewer:
-
-- **No authentication.** Anyone who can reach the API can register endpoints and
-  post events. Real deployments need API keys per tenant.
-- **No SSRF protection.** Endpoint URLs may point at loopback and private
-  ranges, which is required for local testing but would need an egress allowlist
-  in a hosted deployment.
-- **Delivery is at-least-once, deliberately.** The dedup guard narrows the
-  duplicate window; it does not eliminate it. Receivers must deduplicate on
-  `X-Webhook-Id`.
-- **`endpoint_id` is a metric label.** That is one series per endpoint on four
-  metrics. Fine for the tens of endpoints this targets, a cardinality problem at
-  thousands. The breaker gauge is explicitly bounded at 500 series; the latency
-  histogram deliberately omits the label entirely.
-- **Grafana runs with anonymous admin access in the Compose stack.** Correct
-  for a local demo where a login stands between `make up` and a working
-  dashboard; not something to deploy. The Kubernetes deployment uses a
-  generated password instead.
-- **NetworkPolicies are written but not enforced**, because k3s ships Flannel.
-  They need Calico or Cilium to do anything.
-- **The HPA's queue-depth metric is disabled by default.** It needs
-  prometheus-adapter, which is not installed; the CPU target still works. An
-  HPA referencing a metric nobody serves is a silently degraded autoscaler,
-  which is why it is off rather than aspirational.
-- **The full profile needs ~6 GiB of Docker memory.** The `lowmem` profile
-  fits in ~3.5 GiB but gives up Postgres failover, Loki, and Chaos Mesh.
-- **Tracing samples at 100%.** Right at this volume and for a demonstration.
-  Real traffic needs head or tail sampling.
-- **The breaker can overshoot its threshold.** Ten concurrent goroutines can
-  push `consecutive_failures` past 10 before the open takes effect. Deliberate:
-  making the trip exact would need a lock on the hot path, and a few extra
-  failed requests are cheaper than that. The *probe* is exact, which is the part
-  that matters.
-- **A serialization point in delivery is unidentified.** 5× the worker
-  concurrency buys 7% on a machine where nothing is CPU-saturated. The relay
-  pipelining fix was real but not the whole story; ranked next candidates are in
-  [`loadtest/results/optimization-relay-pipelining.md`](loadtest/results/optimization-relay-pipelining.md).
-- **Half the chaos experiments have not run.** Five of ten need Chaos Mesh or a
-  multi-replica Postgres, neither of which fits in 3.825 GiB. Predictions are
-  committed and unresolved.
-- **`payload: null` is accepted.** It is valid JSON and passes validation, so it
-  is stored and delivered as the four bytes `null`. Defensible — payloads are
-  opaque by design — but probably not intentional.
-- **Offset pagination** on `GET /v1/endpoints` drifts under concurrent inserts.
-  Acceptable because endpoints are registered by humans, not by traffic. The
-  events table would need keyset pagination.
+| **1** | Ingest API, schema, idempotency, local stack, CI |
+| **2** | Outbox relay, Valkey Streams, delivery worker, HMAC signing, full-jitter retries, DLQ, replay |
+| **3** | Rate limiting, circuit breaker, tracing, metrics, Grafana, graceful shutdown, SLO |
+| **4** | k3d + Terraform + Helm + ArgoCD, signed images, NetworkPolicies, alerts, runbook |
+| **5** | k6 load tests, the bottleneck hunt and its fix, chaos experiments, the postmortem |
+| **6** | ADRs, `make demo`, the front door you are reading |
 
 ## License
 
-[MIT](LICENSE)
+MIT — see [LICENSE](LICENSE).

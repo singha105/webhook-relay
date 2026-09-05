@@ -43,6 +43,7 @@ CloudNativePG failover.
 | 8 | Partition worker from Valkey | NOT RUN | needs Chaos Mesh |
 | 9 | CPU stress on a worker | NOT RUN | needs Chaos Mesh |
 | 10 | Receiver at the timeout boundary | **RUN** | **Wrong** — see below |
+| 11 | What happens to a suppressed event | **RUN** | **Correct** — the guard defers, not prevents |
 
 ---
 
@@ -247,3 +248,79 @@ blocker.
 Recording them as unresolved is the point. An experiment log where every
 prediction was confirmed is a log where nothing was learned, and a log with
 invented results is worse than no log.
+
+
+---
+
+## Experiment 11 — what happens to an event the guard suppresses
+
+Added on Day 6, because `make demo` surfaced something experiment 2 could not
+see: after a hard kill, ten events sat in `delivering` with no recorded
+outcome and stayed there.
+
+### Prediction
+
+The guard does not prevent the duplicate, it **delays** it. The event cycles —
+lease expires, relay re-enqueues, guard suppresses, worker acks, stranded
+again — until the dedup marker's TTL expires, and is then delivered a second
+time. So over a window longer than `DELIVERY_DEDUP_TTL`, duplicates > 0.
+
+**What would falsify it:** the event reaching a terminal state without a
+second delivery, or staying stranded forever with no duplicate appearing.
+
+### Method
+
+Timings compressed so the full cycle is observable in minutes rather than the
+fifteen the defaults imply — dedup TTL 60s, stale claim 20s, lease 45s. The
+mechanism is unchanged; only the clock is.
+
+The script **asserts the compressed config actually applied** before measuring.
+The first attempt silently used the defaults, because `DELIVERY_DEDUP_TTL` was
+not plumbed through `docker-compose.yml` — the same class of error that
+invalidated three Day 5 experiments. That is now the fourth, and the assertion
+exists so there is not a fifth.
+
+```
+./chaos/compose/11-stranded-delivering.sh
+```
+
+### Result — prediction correct
+
+40 events, 8 in flight at the kill:
+
+```
+time       delivering   delivered    sink       dups
+00:06:52Z  -- KILL -9, 8 requests in flight --
+00:06:53Z  40           0            8          0
+00:07:24Z  40           0            8          0
+00:07:34Z  37           3            11         0     <- reclaim begins
+00:07:55Z  30           10           18         0
+00:08:05Z  4            36           44         7     <- dedup TTL expires
+00:08:16Z  0            40           48         8
+00:11:55Z  0            40           48         8
+
+final: 8 duplicate (event, attempt) pairs, 0 still stranded
+```
+
+The duplicates appear **only after the marker expires**, 73 seconds after the
+kill. And again: 8 in flight, 8 duplicates.
+
+Raw output:
+[`chaos/results/11-stranded-delivering.txt`](../chaos/results/11-stranded-delivering.txt)
+
+### Why this matters
+
+It corrects experiment 2. That experiment watches for ~3 minutes against a
+15-minute dedup TTL and reports 0 duplicates — a correct number that supports
+a wrong conclusion. The guard defers the duplicate past the end of the
+observation window rather than eliminating it.
+
+The underlying bug is that a worker which suppresses a dispatch acks the queue
+entry **without recording an outcome**
+(`internal/worker/worker.go:422-430`), so nothing ever resolves the event and
+the marker eventually expires out from under it. Tracked as
+[#19](https://github.com/singha105/webhook-relay/issues/19).
+
+The general lesson is in the postmortem, and it is the one I would most want a
+reviewer to notice: **an experiment that ends while the system is still in a
+non-terminal state has not finished.**
