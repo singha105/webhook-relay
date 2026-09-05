@@ -69,9 +69,7 @@ make help          # everything else
 
 ```mermaid
 flowchart LR
-    subgraph client[" "]
-        P[Producer]
-    end
+    P[Producer]
 
     subgraph relay["webhook-relay"]
         API["API<br/><small>chi · stdlib http</small>"]
