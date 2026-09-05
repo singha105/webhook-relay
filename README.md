@@ -60,9 +60,14 @@ cloud provider.
 
 ```bash
 make down          # stop everything, delete the volumes
-make chaos-list    # the ten chaos experiments
+make chaos-list    # the chaos experiments and how to run them
 make help          # everything else
 ```
+
+If you would rather bring the stack up by hand and drive it yourself,
+`make up` starts it and `make migrate-up` applies the schema:
+
+![make up and make migrate-up](docs/images/up.png)
 
 ---
 
@@ -192,6 +197,129 @@ It does not — and cannot — prevent a duplicate caused by a **timeout**, beca
 a timeout produces a legitimately new attempt number that *should* be retried.
 That is exactly the case where the receiver already did the work. The window is
 narrowed, not closed, and it cannot be closed from the sender's side.
+
+---
+
+## See it working
+
+### Register an endpoint
+
+The signing secret is generated server-side and returned **exactly once**. It is
+never included in any subsequent response.
+
+![registering an endpoint](docs/images/endpoint.png)
+
+The secret is stored in plaintext rather than hashed, because the delivery
+worker has to recompute an HMAC over the payload at send time. Unlike a
+password, it cannot be a one-way hash. "Shown once" is an API-surface guarantee,
+enforced by the response shape and asserted by tests — not a storage guarantee.
+
+### Ingest an event
+
+Ingest does four things and no more: decode, validate, write one row, return.
+No delivery work, no queue publish, no pre-flight lookup on the request path.
+
+![posting an event](docs/images/ingest.png)
+
+`202`, not `201` — the event is durably recorded, but nothing has been
+delivered. Claiming `201 Created` would imply the work is done.
+
+### Idempotent ingest
+
+Replay the same `Idempotency-Key` and you get the original event back with a
+`200` instead of a `202`. Ten concurrent identical requests produce exactly one
+row.
+
+![idempotent ingest](docs/images/idem.png)
+
+This is resolved by the database, not the application. See
+[the idempotency race](#the-idempotency-race) below.
+
+### Deliver it, retry it, dead-letter it
+
+A worker signs the payload, POSTs it, and records every attempt. When the
+endpoint keeps failing, retries back off with full jitter until the attempt
+budget is spent and the event is dead-lettered.
+
+![retry with full jitter, then dead letter](docs/images/retry.png)
+
+Look at the gaps rather than the timestamps. The **ceiling** doubles — 2s, 4s,
+8s, 16s, 32s — but each actual delay is a uniform draw from `[0, ceiling)`, so
+the sequence trends upward without being monotonic. The 5→6 gap of 10s under a
+32s ceiling is the jitter working, not a bug. A perfectly doubling sequence
+would mean it was not.
+
+Note also `duplicate dispatches: {}` — six attempts, six deliveries, no
+attempt sent twice.
+
+### Replay it, and verify the signature
+
+Point the endpoint at something healthy and replay from the DLQ. The attempt
+budget resets; the failure history does not disappear.
+
+![replay from the DLQ and verify the signature](docs/images/replay.png)
+
+The last step recomputes the HMAC with `openssl` and compares it to the `v1=`
+digest we sent. It matches, which means the signature scheme is verifiable by
+anything that can compute an HMAC — not just by our own Go code.
+
+### Watch it happen
+
+![the Grafana dashboard](docs/images/dashboard.png)
+
+Provisioned from [`deploy/grafana/dashboards/webhook-relay.json`](deploy/grafana/dashboards/webhook-relay.json)
+— the JSON on disk is the source of truth, and UI edits are deliberately
+overwritten on reload. The dashboard is code.
+
+The scattered markers on the latency panel are **exemplars**. Each one links a
+histogram observation to the trace that produced it, so a p99 spike is one click
+from the request that caused it.
+
+### Rate limiting, per endpoint
+
+`rate_limit_per_sec` from Day 1 is now enforced. 300 events posted at once to an
+endpoint configured for 10/s:
+
+![per-endpoint rate limiting](docs/images/ratelimit.png)
+
+The first 11 go straight through — that is the token bucket starting full, which
+avoids a cold-start penalty on the first event to any endpoint. After that it
+converges on exactly the configured rate.
+
+A rate-limited delivery **does not consume an attempt**. The receiver never saw
+a request, so there is nothing to record and nothing that should count against
+the retry budget. Without that rule, a customer using exactly the rate they
+configured would eventually have their events dead-lettered for being slow.
+
+### The circuit breaker
+
+![circuit breaker trips and recovers](docs/images/breaker.png)
+
+Note the middle rows: while the breaker is open, `attempts_reaching_sink` is
+frozen at 13. Not slowed — stopped. That is the point.
+
+`consecutive_failures` overshot the threshold of 10 and tripped at 13, because
+ten worker goroutines were in flight when it crossed. The breaker permits that
+overshoot; what it does not permit is a *probe* stampede, which is why the
+half-open transition is a Lua script.
+
+### One trace, from ingest to the third attempt
+
+![a single trace spanning ingest and three delivery attempts](docs/images/trace.png)
+
+One root span, zero orphans, across two services. The offsets show the retry
+backoff directly.
+
+### Everything self-probes
+
+![container health](docs/images/health.png)
+
+The runtime image is distroless — no shell, no curl — so each binary probes
+itself via `-healthcheck`. The API GETs its own `/readyz`; the worker, which
+serves no HTTP, checks that Postgres and Valkey are both reachable using its
+real configuration.
+
+---
 
 ---
 
