@@ -14,4 +14,4 @@ image:
   # Overwritten by CI with sha-<short-sha>. The placeholder is a real tag that
   # will fail to pull rather than a mutable one that would silently deploy
   # something unknown.
-  tag: "sha-c4ceda54c002"
+  tag: "sha-642c5d0ae34e"
