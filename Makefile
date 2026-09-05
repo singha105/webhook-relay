@@ -175,10 +175,12 @@ test-short: ## Run only unit tests, skipping anything that needs Docker
 	$(GO) test ./... -short -count=1
 
 .PHONY: cover
-cover: ## Run tests and open an HTML coverage report
+cover: ## Run tests, refresh the committed coverage report and badge
 	$(GO) test ./... -coverprofile=coverage.out -covermode=atomic
-	$(GO) tool cover -html=coverage.out -o coverage.html
-	@echo "wrote coverage.html"
+	$(GO) tool cover -html=coverage.out -o docs/coverage/coverage.html
+	$(GO) tool cover -func=coverage.out > docs/coverage/coverage.txt
+	@./scripts/coverage-badge.sh
+	@echo "wrote docs/coverage/{coverage.html,coverage.txt,badge.svg}"
 
 .PHONY: lint
 lint: ## Run golangci-lint
