@@ -37,6 +37,27 @@ worker while deliveries were open:
 
 **2.5% of events were delivered twice** (10 of 400), inside a single kill.
 
+> **Correction, added Day 6.** The "0 duplicates" column above is measured over
+> a ~3 minute window against a 15 minute dedup TTL, and that is not the same
+> thing as "no duplicates happened." Experiment 11 re-ran this with a
+> compressed clock and found the guard **defers** the duplicate rather than
+> preventing it: the suppressed events sit in `delivering` with no recorded
+> outcome until the marker expires, and are then delivered again.
+>
+> ```
+> 00:06:52Z  KILL -9, 8 requests in flight
+> 00:07:34Z  reclaim starts        dups: 0
+> 00:08:05Z  dedup TTL expires     dups: 7
+> 00:08:16Z                        dups: 8   <- all 8 in-flight requests
+> ```
+>
+> So the guard's real effect is narrower than this table implies: it prevents a
+> duplicate *dispatch of the same attempt while the marker is alive*. It buys
+> time, and if nothing resolves the event in that time, the duplicate happens
+> anyway. Tracked as [#19](https://github.com/singha105/webhook-relay/issues/19);
+> evidence in
+> [`chaos/results/11-stranded-delivering.txt`](../chaos/results/11-stranded-delivering.txt).
+
 The number that matters is not 10. It is that **10 was also the number of
 requests in flight, which is also the worker's concurrency setting.** Not a
 coincidence and not a probability — it is a certainty:
@@ -190,6 +211,12 @@ correctly so.
 **The window is narrowed, not closed. It cannot be closed from our side.** The
 only complete fix lives in the receiver, and that is the contract.
 
+And "narrowed" is doing more work than I first credited. Experiment 11 showed
+the guard defers the duplicate by its TTL rather than removing it, because the
+suppressing worker acks the entry without recording an outcome — so the event
+is never resolved and the marker eventually expires out from under it. The
+control is real, and it is weaker than the Day 5 write-up claimed.
+
 ---
 
 ## Contributing factors
@@ -283,6 +310,15 @@ ordering here trades duplication against loss. We chose duplication, on purpose,
 because a duplicate is loud and a loss is silent. That decision should be
 explicit in a design document rather than an accident of the order somebody
 wrote four lines in.
+
+**An observation window is part of a measurement, and it belongs in the
+result.** Experiment 2 watched for three minutes and reported zero duplicates.
+That number was correct and the conclusion drawn from it was wrong, because the
+mechanism it was testing operates on a fifteen-minute clock. Nothing about the
+experiment was sloppy except the unstated assumption that three minutes was
+long enough — and that assumption was invisible until someone asked what
+happens to the suppressed events afterwards. Any experiment that ends while the
+system is still in a non-terminal state has not finished.
 
 **A tuning knob can be a correctness knob.** `WORKER_CONCURRENCY` looks like a
 pure throughput dial. It is also, exactly, the number of duplicates one crash

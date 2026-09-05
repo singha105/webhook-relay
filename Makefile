@@ -119,8 +119,24 @@ demo-up: ## Start the stack plus the controllable test sink
 	@echo "    sink: http://localhost:$(SINK_PORT)   (control: /_control/behavior, /_control/stats)"
 
 .PHONY: demo
-demo: ## Run the day-2 delivery demonstration end to end
+demo: ## ONE COMMAND: bring the stack up and prove it works end to end
+	@./scripts/demo.sh
+
+.PHONY: demo-delivery
+demo-delivery: ## The Day 2 retry/DLQ/replay walkthrough (needs `make demo-up`)
 	@./scripts/demo-delivery.sh
+
+.PHONY: chaos-list
+chaos-list: ## List the chaos experiments and how to run them
+	@echo ""
+	@echo "  Runnable now, on the compose stack:"
+	@for f in chaos/compose/*.sh; do printf '    %s\n' "./$$f"; done
+	@echo ""
+	@echo "  Committed as Chaos Mesh manifests (need the k3d cluster, ~6 GiB Docker):"
+	@for f in chaos/*.yaml; do printf '    %s\n' "$$f"; done
+	@echo ""
+	@echo "  Results and predictions: docs/chaos-results.md"
+	@echo ""
 
 .PHONY: ps
 ps: ## Show stack status

@@ -113,6 +113,14 @@ services:
       # Exposed as an override because Day 5 turns it off on purpose to
       # demonstrate the duplicate deliveries it prevents.
       DELIVERY_DEDUP_ENABLED: "${DELIVERY_DEDUP_ENABLED:-true}"
+      # The three clocks that govern crash recovery. Exposed because chaos
+      # experiment 11 has to compress them: with the defaults, one cycle of
+      # "lease expires -> re-enqueue -> guard suppresses -> stranded again"
+      # takes 5 minutes and the full story takes 15, which is longer than
+      # anyone will watch. Compressing the clock does not change the mechanism.
+      DELIVERY_DEDUP_TTL: "${DELIVERY_DEDUP_TTL:-15m}"
+      DELIVERY_LEASE: "${DELIVERY_LEASE:-5m}"
+      STALE_CLAIM_TIMEOUT: "${STALE_CLAIM_TIMEOUT:-1m}"
       METRICS_ADDR: ":9100"
       OTLP_ENDPOINT: "otel-collector:4317"
       TRACING_ENABLED: "${TRACING_ENABLED:-true}"

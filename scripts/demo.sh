@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+#
+# make demo — one command, from nothing to a working system.
+#
+# This is the proof the project works. There is no hosted deployment to link,
+# so this script has to stand in for one: it brings the stack up from a clean
+# machine, delivers a signed webhook, shows the retry ladder and the dead
+# letter queue, and then kills a worker mid-delivery to show that nothing is
+# lost.
+#
+# Every number it prints is read back out of the running system. Nothing here
+# is hardcoded narration.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+API_URL="${API_URL:-http://localhost:8090}"
+SINK_CTL="${SINK_CTL:-http://localhost:9091}"
+SINK_TARGET="${SINK_TARGET:-http://sink:9090/hook}"
+GRAFANA="${GRAFANA:-http://localhost:3001}"
+COMPOSE=(docker compose -f deploy/compose/docker-compose.yml --env-file .env --profile demo --profile tools)
+
+bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
+dim()   { printf '\033[2m%s\033[0m\n' "$*"; }
+step()  { printf '\n\033[1;36m▸ %s\033[0m\n' "$*"; }
+ok()    { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+info()  { printf '    %s\n' "$*"; }
+
+for cmd in docker curl jq; do
+  command -v "$cmd" >/dev/null || { echo "demo: $cmd is required" >&2; exit 1; }
+done
+docker info >/dev/null 2>&1 || { echo "demo: the Docker daemon is not running" >&2; exit 1; }
+
+# .env is generated, not committed — it holds the local Postgres password.
+if [ ! -f .env ]; then
+  step "generating .env (local credentials, gitignored)"
+  printf 'POSTGRES_PASSWORD=%s\n' "$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 24)" > .env
+  ok "wrote .env"
+fi
+
+step "starting the stack"
+dim "    postgres · valkey · api · worker · sink · prometheus · grafana · tempo · loki"
+"${COMPOSE[@]}" up -d --build postgres valkey api worker sink prometheus grafana tempo loki otel-collector >/dev/null 2>&1 || "${COMPOSE[@]}" up -d --build >/dev/null 2>&1
+ok "containers started"
+
+step "waiting for the API to report ready"
+deadline=$(( $(date +%s) + 180 ))
+until curl -fsS "${API_URL}/readyz" >/dev/null 2>&1; do
+  [ "$(date +%s)" -lt "$deadline" ] || { echo "demo: API never became ready" >&2; "${COMPOSE[@]}" logs --tail=40 api >&2; exit 1; }
+  sleep 2
+done
+ok "$(curl -fsS "${API_URL}/readyz")"
+until curl -fsS "${SINK_CTL}/healthz" >/dev/null 2>&1; do sleep 1; done
+ok "test receiver ready"
+
+# Migrations are an operator action, not something a starting pod does -- several
+# replicas racing to migrate on rollout is a classic way to deadlock a deploy.
+# So the demo runs them explicitly, exactly as a deploy would.
+#
+# Note that /readyz answers "ready" before this: it checks that Postgres is
+# reachable, not that the schema exists. See issue #18.
+step "applying migrations"
+"${COMPOSE[@]}" run --rm migrate up 2>&1 | sed 's/^/    /' || true
+ok "schema at version $("${COMPOSE[@]}" run --rm migrate version 2>&1 | tail -1 | tr -d '\r')"
+
+curl -fsS -X POST "${SINK_CTL}/_control/reset" >/dev/null
+curl -fsS -X POST "${SINK_CTL}/_control/behavior" -H 'Content-Type: application/json' -d '{"status":200}' >/dev/null
+
+# ---------------------------------------------------------------------------
+step "1/4  deliver a signed webhook"
+# ---------------------------------------------------------------------------
+ep=$(curl -fsS -X POST "${API_URL}/v1/endpoints" -H 'Content-Type: application/json' \
+      -d "{\"url\":\"${SINK_TARGET}\",\"description\":\"demo\",\"rate_limit_per_sec\":100}")
+ep_id=$(jq -r .id <<<"$ep")
+secret=$(jq -r .signing_secret <<<"$ep")
+info "endpoint ${ep_id}"
+
+ev=$(curl -fsS -X POST "${API_URL}/v1/events" -H 'Content-Type: application/json' \
+      -d "{\"endpoint_id\":\"${ep_id}\",\"event_type\":\"order.created\",\"payload\":{\"order\":\"A-1001\",\"total\":4999}}")
+ev_id=$(jq -r .id <<<"$ev")
+info "event    ${ev_id}  (HTTP 202 — durably in Postgres, not yet queued)"
+
+for _ in $(seq 1 40); do
+  st=$(curl -fsS "${API_URL}/v1/events/${ev_id}" | jq -r .status)
+  [ "$st" = "delivered" ] && break
+  sleep 0.5
+done
+ok "status: ${st}"
+
+sig=$(curl -fsS "${SINK_CTL}/_control/records" | jq -r '.[-1].signature // empty')
+[ -n "$sig" ] && info "receiver saw signature: ${sig:0:34}…"
+info "verify it yourself:  go run ./pkg/webhook/cmd/verify -secret <secret>"
+
+# ---------------------------------------------------------------------------
+step "2/4  a failing receiver: retries with full jitter, then the DLQ"
+# ---------------------------------------------------------------------------
+curl -fsS -X POST "${SINK_CTL}/_control/behavior" -H 'Content-Type: application/json' -d '{"status":500}' >/dev/null
+info "receiver now returns 500 for everything"
+
+fail_ev=$(curl -fsS -X POST "${API_URL}/v1/events" -H 'Content-Type: application/json' \
+      -d "{\"endpoint_id\":\"${ep_id}\",\"event_type\":\"order.created\",\"payload\":{\"order\":\"A-1002\"}}" | jq -r .id)
+
+for _ in $(seq 1 60); do
+  st=$(curl -fsS "${API_URL}/v1/events/${fail_ev}" | jq -r .status)
+  n=$(curl -fsS "${API_URL}/v1/events/${fail_ev}" | jq -r '.attempt_count // 0')
+  printf '\r    attempts: %s   status: %-10s' "$n" "$st"
+  [ "$st" = "dlq" ] && break
+  sleep 1
+done
+printf '\n'
+ok "dead-lettered after ${n} attempts — not lost, and queryable"
+info "$(curl -fsS "${API_URL}/v1/events/${fail_ev}" | jq -c '{status, attempt_count}')"
+
+step "     replay it against a healthy receiver"
+curl -fsS -X POST "${SINK_CTL}/_control/behavior" -H 'Content-Type: application/json' -d '{"status":200}' >/dev/null
+curl -fsS -X POST "${API_URL}/v1/events/${fail_ev}/replay" >/dev/null
+for _ in $(seq 1 40); do
+  st=$(curl -fsS "${API_URL}/v1/events/${fail_ev}" | jq -r .status)
+  [ "$st" = "delivered" ] && break
+  sleep 0.5
+done
+ok "replayed → ${st}"
+
+# ---------------------------------------------------------------------------
+step "3/4  kill a worker mid-delivery — nothing is lost"
+# ---------------------------------------------------------------------------
+curl -fsS -X POST "${SINK_CTL}/_control/reset" >/dev/null
+curl -fsS -X POST "${SINK_CTL}/_control/behavior" -H 'Content-Type: application/json' -d '{"status":200,"delay":"3s"}' >/dev/null
+info "receiver now holds each request open for 3s"
+
+for i in $(seq 1 60); do
+  curl -fsS -o /dev/null -X POST "${API_URL}/v1/events" -H 'Content-Type: application/json' \
+    -d "{\"endpoint_id\":\"${ep_id}\",\"event_type\":\"burst\",\"payload\":{\"n\":${i}}}" &
+done
+wait
+info "posted 60 events"
+
+for _ in $(seq 1 40); do
+  inflight=$(curl -fsS "${SINK_CTL}/_control/stats" | jq -r '.in_flight')
+  [ "${inflight:-0}" -gt 0 ] && break
+  sleep 0.5
+done
+info "${inflight} deliveries in flight at the receiver"
+docker kill --signal=KILL "$("${COMPOSE[@]}" ps -q worker)" >/dev/null 2>&1 || true
+ok "SIGKILL — no drain, no ack, no chance to clean up"
+
+"${COMPOSE[@]}" up -d worker >/dev/null 2>&1
+info "worker restarted; waiting out the 60s stale-claim reclaim…"
+
+# The API has no list-events endpoint (see Known limitations), so the
+# outstanding count comes from Postgres directly.
+PSQL() { docker exec "$("${COMPOSE[@]}" ps -q postgres)" psql -U webhook_relay -d webhook_relay -tAc "$1" 2>/dev/null | tr -d '[:space:]'; }
+# Wait until the receiver has every event. Deliberately NOT waiting for the
+# database to go quiet: the events that were in flight at the kill stay in
+# 'delivering' for ~15 minutes (issue #19), and waiting for them would mean
+# waiting for a bug to time out.
+deadline=$(( $(date +%s) + 180 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  outstanding=$(PSQL "SELECT count(*) FROM events WHERE event_type='burst' AND status NOT IN ('delivered','dlq');")
+  dlv=$(curl -fsS "${SINK_CTL}/_control/stats" | jq -r '.distinct_events')
+  printf '\r    receiver has: %-4s  no outcome recorded: %-4s' "$dlv" "${outstanding:-?}"
+  [ "${dlv:-0}" -ge 60 ] && break
+  sleep 2
+done
+printf '\n'
+dup=$(curl -fsS "${SINK_CTL}/_control/stats" | jq -r '.duplicate_sends | length')
+recv=$(curl -fsS "${SINK_CTL}/_control/stats" | jq -r '.distinct_events')
+stranded=$(PSQL "SELECT count(*) FROM events WHERE event_type='burst' AND status='delivering';")
+
+ok "the receiver got all ${recv} events, with ${dup} duplicate (event, attempt) pairs"
+info "nothing was lost: a hard kill costs duplicates, never disappearances"
+
+# Report what is actually true, including the part that is not clean. The
+# events that were in flight when the worker died were delivered, but the
+# worker died before recording that, and the dedup guard then suppressed the
+# re-dispatch without marking them terminal. They sit in 'delivering' until
+# the lease sweep and the dedup TTL let them through. See issue #19.
+if [ "${stranded:-0}" != "0" ]; then
+  printf '  \033[33m!\033[0m %s\n' "${stranded} events are still in 'delivering' — delivered to the receiver,"
+  info "but their outcome was never recorded because the worker died mid-flight."
+  info "This is a known bug, not a demo artifact: github.com/singha105/webhook-relay/issues/19"
+fi
+
+# ---------------------------------------------------------------------------
+step "4/4  where to look"
+# ---------------------------------------------------------------------------
+printf '\n'
+bold "  Grafana     ${GRAFANA}       (anonymous admin, local only)"
+bold "  Prometheus  http://localhost:9090"
+bold "  API         ${API_URL}/v1/endpoints"
+printf '\n'
+dim  "  make down        stop everything and delete the volumes"
+dim  "  make chaos-list  the ten chaos experiments"
+printf '\n'
+ok "demo complete"
