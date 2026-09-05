@@ -15,10 +15,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-API_URL="${API_URL:-http://localhost:8090}"
-SINK_CTL="${SINK_CTL:-http://localhost:9091}"
+# Read host ports from .env if it exists, then fall back to the SAME defaults
+# docker-compose.yml uses. Hardcoding them here meant the demo pointed at one
+# machine's personal overrides and could not work on a fresh clone.
+if [ -f .env ]; then
+  set -a; . ./.env; set +a
+fi
+API_URL="${API_URL:-http://localhost:${API_PORT:-8080}}"
+SINK_CTL="${SINK_CTL:-http://localhost:${SINK_PORT:-9091}}"
 SINK_TARGET="${SINK_TARGET:-http://sink:9090/hook}"
-GRAFANA="${GRAFANA:-http://localhost:3001}"
+GRAFANA="${GRAFANA:-http://localhost:${GRAFANA_PORT:-3000}}"
+PROM="${PROM:-http://localhost:${PROMETHEUS_PORT:-9090}}"
 COMPOSE=(docker compose -f deploy/compose/docker-compose.yml --env-file .env --profile demo --profile tools)
 
 bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -41,7 +48,13 @@ fi
 
 step "starting the stack"
 dim "    postgres · valkey · api · worker · sink · prometheus · grafana · tempo · loki"
-"${COMPOSE[@]}" up -d --build postgres valkey api worker sink prometheus grafana tempo loki otel-collector >/dev/null 2>&1 || "${COMPOSE[@]}" up -d --build >/dev/null 2>&1
+if ! "${COMPOSE[@]}" up -d --build postgres valkey api worker sink prometheus grafana tempo loki otel-collector > /tmp/webhook-relay-demo-up.log 2>&1; then
+  echo "demo: the stack failed to start. Last 20 lines:" >&2
+  tail -20 /tmp/webhook-relay-demo-up.log >&2
+  echo "" >&2
+  echo "If this is a port collision, set the offending port in .env (see .env.example)." >&2
+  exit 1
+fi
 ok "containers started"
 
 step "waiting for the API to report ready"
@@ -187,7 +200,7 @@ step "4/4  where to look"
 # ---------------------------------------------------------------------------
 printf '\n'
 bold "  Grafana     ${GRAFANA}       (anonymous admin, local only)"
-bold "  Prometheus  http://localhost:9090"
+bold "  Prometheus  ${PROM}"
 bold "  API         ${API_URL}/v1/endpoints"
 printf '\n'
 dim  "  make down        stop everything and delete the volumes"

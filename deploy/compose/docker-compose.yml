@@ -301,7 +301,9 @@ services:
       dockerfile: Dockerfile.sink
     profiles: ["demo"]
     ports:
-      - "${SINK_PORT:-9090}:9090"
+      # 9091, not 9090: Prometheus already defaults to 9090 on the host, and a
+      # clean clone running `make demo` would collide before anything started.
+      - "${SINK_PORT:-9091}:9090"
     restart: unless-stopped
 
   # Applies migrations, then exits. Kept behind a profile so `docker compose up`
