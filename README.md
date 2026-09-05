@@ -354,8 +354,17 @@ Named here rather than left for a reviewer to find.
 - **A serialization point in delivery is unidentified.** 5× the worker
   concurrency buys 7% on a machine where nothing is CPU-saturated.
   [#6](https://github.com/singha105/webhook-relay/issues/6)
-- **Half the chaos experiments have not run** — five of ten need Chaos Mesh or a
-  multi-replica Postgres, neither of which fits in 3.825 GiB.
+- **Half the chaos experiments have not run** — five of eleven need Chaos Mesh or
+  a multi-replica Postgres. Predictions are committed and unresolved.
+- **The Kubernetes path is not verified end to end.** At 5 GiB of Docker memory
+  the cluster gets much further than it used to: Chaos Mesh, ArgoCD, and a
+  3-replica CloudNativePG cluster all reach `Running`, and `helm_release.argocd`
+  completes in 1m35s once the timeouts are raised. The api and worker pods then
+  crashloop because they cannot reach the Postgres service IP, despite CNPG
+  reporting `3/3 ready` with a valid endpoint on the `-rw` service. That is a
+  cluster networking failure under memory pressure rather than an application
+  bug, and it is unresolved. `make demo` therefore runs the Compose stack, which
+  **is** verified from a clean clone.
 - **No authentication.** Anyone who can reach the API can register endpoints and
   post events. Real deployments need per-tenant API keys.
 - **No SSRF protection.** Endpoint URLs may point at loopback and private
