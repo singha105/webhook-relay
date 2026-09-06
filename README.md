@@ -25,6 +25,61 @@ then a worker SIGKILLed with ten deliveries in flight.*
 
 ---
 
+## The problem this solves
+
+**An application needs to tell someone else that something happened, over a
+network that loses messages, to a server it does not control and cannot fix.**
+
+Every SaaS product eventually has to notify its customers: a payment settled, a
+build finished, a document was signed. The naive implementation is four lines —
+`POST` the JSON and move on. It works in development and fails in production,
+because the receiving server is outside your control and will be broken,
+overloaded, slow, or briefly unreachable, and none of that is your customer's
+fault or yours.
+
+Doing it properly is not hard *code*, it is a pile of unpleasant edge cases that
+have to be handled somewhere:
+
+| The situation | What has to happen |
+|---|---|
+| Receiver returns 503 for ten minutes | Retry with backoff, without hammering them into staying down |
+| Receiver is permanently gone | Stop eventually, and make the failure visible rather than silent |
+| Your own process dies mid-send | Recover the work — without spamming a receiver that already got it |
+| Receiver is slower than your timeout | Decide what a timeout even *means*, because it is not a failure |
+| 500 events fail at once, then the receiver recovers | Do not deliver all 500 in the same millisecond and kill it again |
+| Receiver asks "did you really send this?" | Be able to prove it, months later |
+| A customer's endpoint gets DDoSed by your retries | Rate limit per endpoint, and stop calling a dead one entirely |
+
+Written inline, that logic gets duplicated in every service that sends
+notifications, implemented slightly differently each time, and tested by nobody.
+**This project extracts it into one component with one job.** The application
+hands over an event and forgets about it; the relay owns delivery, retries,
+backpressure, and the audit trail.
+
+### Requirements it was built against
+
+| | Requirement |
+|---|---|
+| **Functional** | Accept an event and durably store it before acknowledging |
+| | Deliver to a registered HTTPS endpoint, signed, so the receiver can verify origin |
+| | Retry transient failures; give up on permanent ones; never fail silently |
+| | Make every attempt inspectable after the fact |
+| | Allow a failed event to be replayed once the receiver is fixed |
+| **Non-functional** | No event may be lost once accepted — duplicates are acceptable, loss is not |
+| | One slow receiver must not stall delivery for everyone else |
+| | Survive the loss of any single component without losing accepted events |
+| | Be observable enough to debug a specific customer's specific event |
+| **Constraint** | Entirely free and open source, self-hosted, no cloud account anywhere |
+
+### What it is not
+
+Not a message broker (it does not do fan-out or pub/sub — use Kafka or NATS),
+not a task queue for internal jobs (use a job runner), and not a notification
+service for humans (no email, SMS, or push). It does exactly one thing: deliver
+HTTP callbacks to third-party endpoints, reliably and accountably.
+
+---
+
 > ### 📄 Start here: [Postmortem — duplicate webhook deliveries](docs/postmortem-duplicate-delivery.md)
 >
 > I killed a worker mid-delivery and measured what broke. Every request in
@@ -78,7 +133,39 @@ If you would rather bring the stack up by hand and drive it yourself,
 
 ---
 
-## Architecture
+## High-level design (HLD)
+
+### System context
+
+Who talks to what, and where the trust boundaries are.
+
+```mermaid
+flowchart LR
+    subgraph ext1[" "]
+        PROD["Producer application<br/><small>the customer of this system</small>"]
+    end
+    subgraph sys["webhook-relay — the system under design"]
+        RELAY["Ingest · store · schedule · deliver · record"]
+    end
+    subgraph ext2[" "]
+        RECV["Third-party HTTP endpoints<br/><small>outside our control</small>"]
+        OPS["Operators<br/><small>dashboards, alerts, runbook</small>"]
+    end
+
+    PROD -->|"POST /v1/events"| RELAY
+    PROD -->|"GET status, replay"| RELAY
+    RELAY -->|"signed POST, retried"| RECV
+    RELAY -->|"metrics · logs · traces"| OPS
+
+    style RELAY fill:#1a1d21,color:#fff
+    style RECV fill:#2d7d46,color:#fff
+```
+
+The asymmetry is the whole design problem: we control everything inside the box
+and nothing to the right of it. Receivers cannot be fixed, restarted, or
+reasoned with — only accommodated.
+
+### Component view
 
 ```mermaid
 flowchart LR
@@ -127,6 +214,90 @@ The dashed arrow is the one that makes the system survivable. When a worker
 dies holding entries, `XAUTOCLAIM` hands them to a live worker after the stale
 timeout. It is also the arrow that causes duplicate deliveries, which is what
 the [postmortem](docs/postmortem-duplicate-delivery.md) is about.
+
+### Responsibilities
+
+Each component has exactly one job, and the boundaries are enforced by what
+each is *allowed to touch*.
+
+| Component | Owns | Deliberately cannot |
+|---|---|---|
+| **API** (`cmd/api`) | Validation, idempotency, one transactional write, read APIs | Touch the queue, or perform any delivery work |
+| **Outbox relay** (`internal/relay`) | Claiming due events, leasing, enqueueing, sweeping expired leases | Send HTTP to receivers |
+| **Queue** (Valkey Streams) | Handing ready work to exactly one worker; tracking in-flight ownership | Be a system of record — it is a transport |
+| **Worker pool** (`internal/worker`) | Guards, signing, the HTTP call, recording outcomes, acking | Invent work; it only processes what the relay produced |
+| **Guards** (ratelimit, breaker, dedup) | Deciding whether *this* delivery may proceed right now | Persist anything that must survive Valkey loss |
+| **Postgres** | Every fact that must survive a crash | — |
+
+### Request lifecycle
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Producer
+    participant A as API
+    participant DB as Postgres
+    participant R as Relay
+    participant Q as Valkey
+    participant W as Worker
+    participant E as Endpoint
+
+    P->>A: POST /v1/events
+    A->>DB: INSERT … ON CONFLICT (idempotency)
+    DB-->>A: event row
+    A-->>P: 202 Accepted
+    Note over A,P: 202 means durably stored, nothing more
+
+    loop every 250ms
+        R->>DB: claim batch, stamp lease
+        R->>Q: XADD (pipelined)
+    end
+
+    W->>Q: XREADGROUP
+    W->>DB: load endpoint + event
+    W->>W: breaker → rate limit → dedup
+    W->>E: POST + HMAC-SHA256
+    E-->>W: 2xx / 5xx / timeout
+    W->>DB: record attempt, update status
+    W->>Q: XACK
+    Note over W,Q: crash between the POST and XACK = duplicate
+```
+
+### Deployment topology
+
+Two independent paths, both committed, both runnable:
+
+| | Local (`make demo`) | Kubernetes (`make demo-k8s`) |
+|---|---|---|
+| Orchestration | docker-compose | k3d cluster, Helm chart |
+| Postgres | single container | CloudNativePG operator |
+| Delivery | — | ArgoCD, pull-based ([ADR 0005](docs/adr/0005-gitops-pull-over-push.md)) |
+| Secrets | `.env`, gitignored | Sealed Secrets ([ADR 0006](docs/adr/0006-sealed-secrets-over-cloud-kms.md)) |
+| Scaling | fixed | HPA on CPU; queue-depth metric available but off |
+| Status | **fully verified** | verified on the single-node profile ([#21](https://github.com/singha105/webhook-relay/issues/21)) |
+
+### Design constraints and their consequences
+
+| Choice | Bought | Cost |
+|---|---|---|
+| Outbox over dual-write | 202 means exactly one thing; queue loss is survivable | ≤250ms added latency; relay is a serial chokepoint |
+| At-least-once | Never loses an accepted event | Receivers must dedupe on `X-Webhook-Id` |
+| Valkey Streams over Kafka | No JVM, no ZooKeeper, one extra process | Single-threaded; depth metric untruthful above `MAXLEN` |
+| Postgres as system of record | One place to look; trivially consistent | All delivery state transitions hit one primary |
+| Per-endpoint rate limit | Protects receivers | Does **not** protect against one tenant monopolising workers |
+
+### Scale characteristics
+
+Measured on one laptop (see [Performance](#performance)): **~875 events/sec in,
+~870/sec out**. The known limits, in the order they would bite:
+
+1. **One shared queue** — a slow receiver occupies workers everyone else needs.
+   The first thing to fix; see [What I would do differently](#what-i-would-do-differently-at-scale).
+2. **The relay is serial** — sole producer for the whole system. Batching its
+   enqueues bought 5.4%; it remains a single point of throughput.
+3. **A single Postgres primary** absorbs every state transition.
+4. **An unidentified serialization point** — 5× the workers buys 7% on an
+   unsaturated machine ([#6](https://github.com/singha105/webhook-relay/issues/6)).
 
 ---
 
@@ -589,6 +760,262 @@ not take one round trip per mistake. The `request_id` matches the one on every
 log line for that request, and is echoed in the `X-Request-ID` response header.
 
 ---
+
+---
+
+## Low-level design (LLD)
+
+The HLD says what the components are. This says how they are actually built —
+schema, contracts, key formats, and the algorithms. Everything here is
+verifiable against the code; file references are given throughout.
+
+### Data model
+
+Three tables. Every column earns its place, and every index is argued for
+individually in [`migrations/000001_init.up.sql`](migrations/000001_init.up.sql).
+
+```mermaid
+erDiagram
+    endpoints ||--o{ events : "receives"
+    events ||--o{ delivery_attempts : "logs"
+
+    endpoints {
+        uuid id PK
+        text url
+        text signing_secret "plaintext by necessity"
+        bool is_active
+        int rate_limit_per_sec "1..1000"
+        int consecutive_failures "feeds the breaker"
+        timestamptz created_at
+        timestamptz updated_at "trigger-maintained"
+    }
+    events {
+        uuid id PK "UUIDv7, app-supplied"
+        uuid endpoint_id FK "ON DELETE CASCADE"
+        text event_type
+        jsonb payload "<= 256 KiB"
+        text status "5 states"
+        text idempotency_key "nullable"
+        int attempt_count "denormalized"
+        timestamptz next_retry_at "also the lease expiry"
+        timestamptz created_at
+    }
+    delivery_attempts {
+        uuid id PK
+        uuid event_id FK
+        int attempt_number "UNIQUE with event_id"
+        int status_code "NULL = no response at all"
+        text response_body "truncated to 2 KiB"
+        text error_message
+        int duration_ms
+        timestamptz attempted_at
+    }
+```
+
+**Three columns worth explaining.**
+
+`signing_secret` is stored in plaintext, not hashed. Unlike a password it must
+be *recomputed* against at send time, so a one-way hash is impossible. The
+"shown once" guarantee is enforced at the API boundary instead — the field is
+tagged `json:"-"` so it can never be serialised into a response after creation.
+
+`next_retry_at` does two jobs. For `pending`/`failed` events it means "do not
+deliver before this time". For `delivering` events it is a **lease expiry** —
+if a worker dies and the queue entry is lost too, the expired lease is what
+lets the relay notice and requeue. One column, `NOT NULL` with a `now()`
+default, so `ORDER BY` is served straight from an index with no `COALESCE`.
+
+`status_code` is nullable, and the NULL is meaningful: it means no HTTP
+response existed at all (timeout, refused, DNS). That distinction is load-bearing
+for retry classification — and collapsing timeout and refused into the same NULL
+is a known shortcoming ([#16](https://github.com/singha105/webhook-relay/issues/16)).
+
+### Indexes
+
+| # | Index | Serves | Why partial |
+|---|---|---|---|
+| 1 | `(endpoint_id, idempotency_key) WHERE key IS NOT NULL` | Idempotency — a **correctness** constraint, not a speed one | Most events carry no key |
+| 2 | `(next_retry_at) WHERE status IN (pending, failed, delivering)` | The relay's global claim + lease sweep | Tracks the *backlog*, not lifetime volume |
+| 3 | `(endpoint_id, next_retry_at) WHERE status IN (…)` | Per-endpoint operator queries | Same |
+| 4 | `UNIQUE (event_id, attempt_number)` | Attempt numbering idempotency **and** the read path for `GET /v1/events/{id}` | — |
+
+Deliberately **not** indexed: `status` alone (five distinct values — the planner
+would seq-scan anyway), `payload` (GIN is the most expensive index to maintain
+on write, and this is the write path), `event_type` (no query filters on it yet).
+
+### Event state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: POST /v1/events (202)
+    pending --> delivering: relay claims + leases
+    delivering --> delivered: 2xx
+    delivering --> failed: 5xx / timeout
+    delivering --> dlq: 4xx (non-retryable)
+    failed --> delivering: backoff elapsed
+    failed --> dlq: attempt_count = 6
+    delivering --> failed: lease expired (worker died)
+    dlq --> pending: POST /replay
+    delivered --> [*]
+    dlq --> [*]
+```
+
+`delivered` and `dlq` are the only terminal states, and both are reachable via
+the API. There is no state in which an event is unaccounted for.
+
+### API contracts
+
+Ingest — the only endpoint on the hot path:
+
+```http
+POST /v1/events
+Content-Type: application/json
+Idempotency-Key: order-4471        # optional, scoped per endpoint
+
+{ "endpoint_id": "...", "event_type": "order.created", "payload": { ... } }
+```
+
+| Response | Meaning |
+|---|---|
+| `202 Accepted` | Durably committed to Postgres. **Not** queued, not delivered. |
+| `200 OK` | Idempotency key replay — returns the original event |
+| `400` | Malformed JSON |
+| `413` | Request body too large |
+| `422` | Valid JSON, invalid fields — **including an unknown `endpoint_id`** |
+
+`202` rather than `201` is deliberate: `201 Created` would imply the work is
+done. An unknown `endpoint_id` is `422` rather than `404` for the same kind of
+precision — the URL was correct, it is the *body* that references something
+that does not exist. Errors use one envelope everywhere — `{"error": {"code", "message",
+"fields", "request_id"}}` — so a client parses one shape.
+
+### Delivery request
+
+What a receiver actually sees:
+
+```http
+POST /their/path
+Content-Type: application/json
+User-Agent: webhook-relay          # configurable
+X-Webhook-Id: 01a0683c-ccb9-74ae-b046-cec48225323d
+X-Webhook-Timestamp: 1788564742
+X-Webhook-Signature: t=1788564742,v1=94ddf64fbdcc3428d8...
+X-Webhook-Attempt: 3
+```
+
+`X-Webhook-Id` is **stable across every retry** — it is the receiver's
+deduplication key, and the contract in [ADR 0004](docs/adr/0004-at-least-once-over-exactly-once.md)
+depends on it. `X-Webhook-Attempt` is informational; receivers must not treat
+attempt 1 differently.
+
+### Signing algorithm
+
+```
+signature = HMAC-SHA256(secret, "{unix_timestamp}.{raw_request_body}")
+header    = "t={unix_timestamp},v1={hex(signature)}"
+```
+
+Three details that are each a vulnerability if skipped:
+
+- **The timestamp is inside the signed payload**, not merely alongside it.
+  Otherwise a captured request replays forever with a valid signature.
+- **The raw body is signed**, before any parsing or re-serialisation. Re-encoding
+  JSON can reorder keys and invalidate an otherwise-correct signature.
+- **Comparison is constant-time** (`hmac.Equal`). A byte-by-byte compare that
+  short-circuits leaks the correct signature one byte at a time under timing
+  analysis.
+
+Verification is published as an importable package,
+[`pkg/webhook`](pkg/webhook/) — the one package at **100% coverage**, because a
+bug there is a bug in someone else's codebase.
+
+### Retry policy
+
+```
+delay = U(0, min(cap, base × 2^attempt))     base 1s · cap 1h · 6 attempts
+```
+
+Full jitter — a uniform draw over the *whole* interval, not a perturbation
+around the exponential value ([ADR 0003](docs/adr/0003-full-jitter-backoff.md)).
+
+| Receiver response | Classification | Action |
+|---|---|---|
+| `2xx` | success | mark delivered, reset `consecutive_failures` to 0 |
+| `429`, `503` + `Retry-After` | retryable | honour the header if it is sane |
+| `5xx` | retryable | backoff, increment failures |
+| `4xx` (other) | **permanent** | straight to DLQ — retrying an identical request cannot help |
+| timeout / refused / DNS | retryable, `status_code = NULL` | backoff |
+
+Redirects are **not** followed: a 301 to a different host would send a signed
+payload somewhere the customer never registered.
+
+### Valkey key layout
+
+Every key is namespaced by purpose, and none of them is a system of record —
+all of this can be lost without losing an event.
+
+| Key | Type | Purpose | TTL |
+|---|---|---|---|
+| `webhook-relay:deliveries` | Stream | The work queue, trimmed `MAXLEN ~ 100000` | — |
+| `delivery:{event_id}:{attempt}` | String (SETNX) | Dedup guard — one dispatch per attempt | 15 min |
+| `ratelimit:endpoint:{id}` | Hash | Token bucket state | idle expiry |
+| `breaker:endpoint:{id}` | String | Consecutive-failure state | cooldown |
+| `breaker:probe:{id}` | String (SETNX) | Ensures exactly **one** half-open probe | cooldown |
+
+All workers join a single consumer group, `delivery-workers`, so each entry goes
+to exactly one worker rather than being fanned out to all of them.
+
+The dedup key is `(event_id, attempt)`, not `event_id` — which is precisely why
+it cannot help with the timeout case: a timeout produces a legitimately *new*
+attempt number ([postmortem](docs/postmortem-timeout-boundary.md)).
+
+### Concurrency model
+
+| Mechanism | Where | Guarantees |
+|---|---|---|
+| `INSERT … ON CONFLICT DO UPDATE` | ingest | Idempotency under concurrent identical requests, resolved by the DB |
+| `FOR UPDATE SKIP LOCKED` | relay claim | Several relay replicas take **disjoint** batches without coordinating |
+| Consumer group + `XAUTOCLAIM` | queue | One worker per entry; dead workers' entries recovered after 60s |
+| Lease in `next_retry_at` | relay sweep | Second recovery path if the queue *itself* is lost |
+| Lua script (atomic) | rate limit, breaker probe | Check-and-decrement cannot interleave between replicas |
+
+Two independent recovery paths is not redundancy for its own sake. `XAUTOCLAIM`
+recovers a dead *worker*; the lease sweep recovers a dead *queue*. Neither
+covers the other's failure.
+
+Worker concurrency is `WORKER_CONCURRENCY` goroutines, each processing its
+claimed batch **serially** — so in-flight parallelism equals that number, and
+batch size only reduces round trips. That number is also, exactly, the number of
+duplicates one crash produces ([#10](https://github.com/singha105/webhook-relay/issues/10)).
+
+### Configuration
+
+Every knob, its default, and what raising it costs.
+
+| Variable | Default | Effect of raising |
+|---|---|---|
+| `WORKER_CONCURRENCY` | 10 | More throughput — **and a proportionally larger duplicate blast radius** |
+| `DB_MAX_CONNS` | 10 | Must exceed concurrency; workers and the relay share one pool |
+| `RELAY_POLL_INTERVAL` | 250ms | Lower = less latency, more idle queries |
+| `RELAY_BATCH_SIZE` | 100 | Larger batches, fewer round trips, coarser lease granularity |
+| `MAX_ATTEMPTS` | 6 | Longer before DLQ |
+| `RETRY_BASE_DELAY` / `RETRY_MAX_DELAY` | 1s / 1h | The backoff curve |
+| `DELIVERY_TIMEOUT` | 10s | Longer patience; see the [timeout-boundary postmortem](docs/postmortem-timeout-boundary.md) |
+| `DELIVERY_LEASE` | 5m | How long before a stuck `delivering` event is requeued |
+| `STALE_CLAIM_TIMEOUT` | 60s | How long before a dead worker's entry is reclaimed |
+| `DELIVERY_DEDUP_TTL` | 15m | Must exceed the reclaim window, or the guard misses |
+| `BREAKER_THRESHOLD` / `BREAKER_COOLDOWN` | 10 / 5m | When to stop calling a failing endpoint |
+
+### Failure modes, by component
+
+| What dies | Detected by | Recovery | Events lost |
+|---|---|---|---|
+| A worker, mid-delivery | `XAUTOCLAIM` after 60s | Another worker takes the entry | **0** — but duplicates without the guard |
+| The whole worker pool | Backlog age alert | Restart; queue is untouched | **0** (verified: 730 events, 0 lost) |
+| Valkey (total loss) | Workers see `NOGROUP` | Group recreated; relay re-enqueues from Postgres | **0** (verified: 200/200) |
+| The relay | Lease expiry | Another replica claims; leases expire naturally | **0** |
+| Postgres primary | CNPG | Failover; writes resume | **0** (untested — needs 3 replicas) |
+| A receiver | Consecutive failures | Breaker opens, retries back off, then DLQ | **0** — dead-lettered, not dropped |
 
 ---
 
