@@ -69,6 +69,19 @@ options:
       - arg: --disable=servicelb
         nodeFilters:
           - server:*
+      # host-gw instead of the default VXLAN backend.
+      #
+      # Every k3d "node" is a container on one Docker bridge, so the nodes are
+      # already on a shared L2 segment and encapsulation buys nothing. It also
+      # costs: on Docker Desktop for Mac, flannel's VXLAN traffic is silently
+      # dropped for TCP while ICMP passes, which presents as pods that can ping
+      # each other but cannot open a connection -- a database reporting itself
+      # healthy while every client gets "connection refused".
+      #
+      # host-gw just writes routes, so there is no overlay to misbehave.
+      - arg: --flannel-backend=host-gw
+        nodeFilters:
+          - server:*
       # Metrics-server IS kept: the HPA on the api deployment needs it for CPU
       # metrics, and without it the HPA silently reports <unknown>/70%.
       - arg: --disable=metrics-server=false

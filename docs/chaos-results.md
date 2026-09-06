@@ -37,7 +37,7 @@ CloudNativePG failover.
 | 2 | Same, dedup disabled | **RUN** | **Correct** |
 | 3 | Poison message | **RUN** | **Correct** |
 | 4 | 30s latency vs 10s timeout | NOT RUN | needs Chaos Mesh |
-| 5 | Kill Valkey | Script committed | needs a run |
+| 5 | Kill Valkey | **RUN** | **Correct** |
 | 6 | Kill the Postgres primary | NOT RUN | needs CNPG, 3 replicas |
 | 7 | Workers to zero for 5 min | NOT RUN | needs Chaos Mesh |
 | 8 | Partition worker from Valkey | NOT RUN | needs Chaos Mesh |
@@ -151,6 +151,60 @@ handle. Filed as a question rather than a bug; see Known gaps.
 
 ---
 
+## Experiment 5 — kill Valkey
+
+### Prediction
+
+Valkey runs with no persistence, so a hard kill loses the queue, the consumer
+group, the rate-limit buckets, the breaker state and the dedup keys. The events
+themselves are untouched, because Postgres is the system of record: they sit in
+`delivering` with a lease, and when it expires the outbox relay requeues them.
+
+Expected: workers hit `NOGROUP`, recreate the group, and carry on. Nothing
+lost, some events delayed by up to one lease period.
+
+### Result — prediction correct
+
+```
+  before the kill:
+    delivered: 30
+    delivering: 170
+    stream length: 200
+  KILL -9 valkey
+  valkey restarted (empty)
+
+  after recovery:
+    delivered: 200
+    sink received: 200
+    duplicates:    0
+    consumer group recreated: delivery-workers
+```
+
+**Zero events lost.** 170 events had been claimed and had their queue entries
+destroyed along with the stream; every one came back through the lease sweep and
+was delivered.
+
+Raw output: [`chaos/results/05-kill-valkey.txt`](../chaos/results/05-kill-valkey.txt)
+
+### What this validates
+
+This is the payoff for [ADR 0002](adr/0002-transactional-outbox.md). The queue is
+a transport, never a system of record, and this experiment is what makes that
+claim testable rather than aspirational — the entire queue was destroyed
+mid-flight and the only cost was latency.
+
+The zero duplicates are worth a note, because they are not luck. Killing Valkey
+does not kill the workers, so deliveries already in flight completed normally and
+recorded their outcomes. Only the *queue entries* were lost, and a lost queue
+entry for an event that was already delivered is harmless — the relay only
+requeues events that are still non-terminal in Postgres.
+
+The `NOGROUP` recovery path is the Day 3 fix earning its place. Before it,
+workers wedged on that error forever; it was found by flushing Valkey by hand
+and watching the pipeline stop.
+
+---
+
 ## Experiment 10 — a receiver at the timeout boundary
 
 ### Prediction
@@ -237,7 +291,7 @@ behaviour our system produces.
 
 Experiments 4, 6, 7, 8 and 9 need infrastructure this machine could not host:
 
-- **4, 7, 8, 9** need Chaos Mesh, which needs the cluster, which needs ~6 GiB.
+- **4, 7, 8, 9** need Chaos Mesh, which needs the cluster.
 - **6** needs CloudNativePG with 3 replicas; the low-memory profile runs 1, and
   a single instance has nothing to fail over to.
 

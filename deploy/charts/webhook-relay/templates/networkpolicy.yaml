@@ -262,4 +262,71 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ .Values.networkPolicy.observabilityNamespace }}
+---
+{{/*
+  Postgres ingress.
+
+  Separate from the datastores policy above because CloudNativePG pods carry
+  cnpg.io/* labels rather than app.kubernetes.io/name, so a single podSelector
+  cannot address both, and the two need different ports anyway.
+
+  This policy did not exist until Day 6, and its absence was invisible: the
+  default-deny applies to every pod in the namespace, so Postgres was firewalled
+  off from the application entirely. It stayed hidden because the app pods spent
+  every previous cluster inspection in ImagePullBackOff -- they never got far
+  enough to open a connection and be refused. The first time the image was
+  correct, every pod crashlooped on "connection refused" against a database
+  that was reporting itself perfectly healthy.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "webhook-relay.fullname" . }}-postgres-ingress
+  labels:
+    {{- include "webhook-relay.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: {{ include "webhook-relay.fullname" . }}-db
+  policyTypes:
+    - Ingress
+  ingress:
+    # The application.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "webhook-relay.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Instance to instance: streaming replication, and the joining of a new
+    # replica. Without this a multi-instance cluster cannot form a quorum, which
+    # presents as a cluster stuck in "Failing over" with replicas that cannot
+    # reach the -rw endpoint.
+    - from:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: {{ include "webhook-relay.fullname" . }}-db
+      ports:
+        - protocol: TCP
+          port: 5432
+    # The operator drives switchover and backups through the instance manager.
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudnative-pg
+      ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 9443
+    # Prometheus scraping the exporter.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.observabilityNamespace }}
+      ports:
+        - protocol: TCP
+          port: 9187
 {{- end }}

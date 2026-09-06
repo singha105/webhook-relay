@@ -1,0 +1,18 @@
+NOTICE:  truncate cascades to table "events"
+NOTICE:  truncate cascades to table "delivery_attempts"
+  posting 200 events
+  before the kill:
+    delivered: 30
+    delivering: 170
+    stream length: 200
+  KILL -9 valkey
+  valkey restarted (empty)
+  waiting up to 6 minutes for the system to drain on its own...
+
+  after recovery:
+    delivered: 200
+    sink received: 200
+    duplicates:    0
+    consumer group recreated: delivery-workers
+
+  Events lost = 200 minus (delivered + dlq).

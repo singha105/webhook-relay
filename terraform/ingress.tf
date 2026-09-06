@@ -89,5 +89,13 @@ resource "helm_release" "ingress_nginx" {
     }
   })]
 
-  depends_on = [kubernetes_namespace.this]
+  # kube-prometheus-stack owns the ServiceMonitor CRD, and the values above
+  # enable a ServiceMonitor. Without this the two races on a FRESH cluster and
+  # Helm fails with "no matches for kind ServiceMonitor" -- which only shows up
+  # on a cluster that has never had the CRDs installed, because a re-run finds
+  # them left behind by the previous one. Found by rebuilding from scratch.
+  depends_on = [
+    kubernetes_namespace.this,
+    helm_release.kube_prometheus_stack,
+  ]
 }
