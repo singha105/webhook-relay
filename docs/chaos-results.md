@@ -45,10 +45,10 @@ CloudNativePG failover.
 | 1 | Kill a worker mid-delivery | Covered by #2 | — |
 | 2 | Same, dedup disabled | **RUN** | **Correct** |
 | 3 | Poison message | **RUN** | **Correct** |
-| 4 | 30s latency vs 10s timeout | NOT RUN | needs Chaos Mesh |
+| 4 | 30s latency vs 10s timeout | **RUN** | **Inconclusive** — fault injected but traffic unaffected |
 | 5 | Kill Valkey | **RUN** | **Correct** |
 | 6 | Kill the Postgres primary | NOT RUN | needs CNPG, 3 replicas |
-| 7 | Workers to zero for 5 min | NOT RUN | needs Chaos Mesh |
+| 7 | Workers to zero for 5 min | **RUN** | **Partly wrong** |
 | 8 | Partition worker from Valkey | NOT RUN | needs Chaos Mesh |
 | 9 | CPU stress on a worker | NOT RUN | needs Chaos Mesh |
 | 10 | Receiver at the timeout boundary | **RUN** | **Wrong** — see below |
@@ -214,6 +214,124 @@ and watching the pipeline stop.
 
 ---
 
+## Experiment 7 — workers killed repeatedly while ingest continues
+
+Run on the single-node k3d cluster with Chaos Mesh, `pod-kill` with `mode: all`
+against the worker Deployment every 30s for three minutes, while posting ~5
+events/sec.
+
+### Prediction
+
+From the manifest: *"pod-kill on ALL workers every 30s for 5 minutes is
+equivalent in effect — nothing stays up long enough to consume."* Backlog was
+expected to grow at the ingest rate, backlog-age alerts to fire, and the API's
+readiness probe to shed ingest once the backlog aged past 2 minutes.
+
+### Result — the equivalence claim is falsified
+
+```
+  [16:35:59Z] posted=100 ingest_errors=0 pending=0   api_ready=[True True]
+  [16:36:26Z] posted=200 ingest_errors=0 pending=56  api_ready=[True True]
+  [16:37:44Z] posted=500 ingest_errors=0 pending=10  api_ready=[True True]
+  [16:38:30Z] posted=700 ingest_errors=0 pending=80  api_ready=[True True]
+
+  events accepted by the API:   730
+  ingest errors during chaos:   0
+  rows in the database:         730
+  delivered:                    730
+  dead-lettered:                0
+  LOST (accepted, no row):      0
+```
+
+**Zero events lost, zero ingest errors, and the backlog never ran away.** It
+oscillated between 0 and 80 and was fully drained afterwards.
+
+The manifest's central claim — that repeated `pod-kill` is equivalent to
+scaling to zero — is **wrong**. Kubernetes restarts a killed pod in a few
+seconds, and the workers drained the backlog in the gaps between kills. A
+30-second kill interval against a pod that recovers in ~5 seconds leaves ~25
+seconds of working capacity in every cycle. "Nothing stays up long enough to
+consume" was an assumption, and it did not survive contact with the scheduler.
+
+### What this does and does not establish
+
+It **does** establish the thing that actually matters: repeatedly killing every
+worker mid-flight, for three minutes, loses nothing. Ingest never failed,
+because the API does not depend on workers — the outbox decoupling doing its
+job.
+
+It does **not** test the backlog-growth and alerting predictions. Those were
+written for 200 events/sec and this run used 5/sec, so the backlog never had a
+chance to grow: at that rate the surviving capacity exceeded the ingest rate.
+Those predictions remain untested rather than disproven, and re-running at a
+realistic rate is the obvious follow-up.
+
+Raw output: [`chaos/results/07-scale-workers-to-zero.txt`](../chaos/results/07-scale-workers-to-zero.txt)
+
+---
+
+## Experiment 4 — 30s latency toward the receiver
+
+### Prediction
+
+Every delivery times out at 10s, the pool stalls, the breaker opens after 10
+consecutive failures, and the pool then recovers even though the endpoint is
+still broken.
+
+### Result — inconclusive, and the reason is the interesting part
+
+```
+  posted 20 events with latency CONFIRMED injected
+  [t+40s]  delivered=20 | attempts=20 timeouts=0 cf=0
+  [t+240s] delivered=20 | attempts=20 timeouts=0 cf=0
+```
+
+Every event delivered on the first attempt. Zero timeouts. The breaker never
+moved.
+
+The obvious reading is "the prediction was wrong", and that reading would be
+false. Chaos Mesh reports the fault as fully applied:
+
+```
+  phase: Run
+  targets injected: 3
+   - webhook-relay/webhook-relay-worker-...  Injected
+   - webhook-relay/webhook-relay-worker-...  Injected
+   - webhook-relay/webhook-relay-sink-...    Injected
+   cond: Selected     True
+   cond: AllInjected  True
+```
+
+Three pods injected, all conditions green — and traffic between those exact
+pods is unaffected. A first run was discarded because it posted events five
+seconds after applying the chaos, before injection completed; this run
+confirmed injection first and got the same result.
+
+The most likely cause is address translation. The worker connects to the sink's
+**Service ClusterIP**, which iptables DNATs to a pod IP, while the `NetworkChaos`
+target selector resolves to pod IPs. If the tc filter and the packet disagree
+about the destination address at the point the filter runs, the delay matches
+nothing — while Chaos Mesh still reports a successful injection, because from
+its perspective the qdisc was installed correctly.
+
+**So the prediction is untested, not falsified.** The honest status of this
+experiment is that the tool reported success and the system was not perturbed,
+and until that is resolved nothing can be concluded about the breaker.
+
+That is worth recording for its own sake: **a chaos experiment that silently
+fails to inject is worse than one that does not run**, because it produces a
+clean result that looks like evidence. The tell was that the outcome was *too*
+clean — 20 for 20 on first attempt, with a 30-second delay supposedly in front
+of a 10-second timeout.
+
+Follow-up: target the delay at the sink's ingress rather than the worker's
+egress, or point the endpoint at the pod IP directly to take the Service out of
+the path.
+
+Raw output: [`chaos/results/04-network-latency-to-sink.txt`](../chaos/results/04-network-latency-to-sink.txt)
+
+---
+
 ## Experiment 10 — a receiver at the timeout boundary
 
 ### Prediction
@@ -300,7 +418,7 @@ behaviour our system produces.
 
 Experiments 4, 6, 7, 8 and 9 need infrastructure this machine could not host:
 
-- **4, 7, 8, 9** need Chaos Mesh, which needs the cluster.
+- **8 and 9** need Chaos Mesh driving traffic patterns this run did not exercise.
 - **6** needs CloudNativePG with 3 replicas; the low-memory profile runs 1, and
   a single instance has nothing to fail over to.
 

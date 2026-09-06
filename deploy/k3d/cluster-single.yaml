@@ -1,0 +1,86 @@
+# Single-node profile: 1 server, no agents.
+#
+# Exists because pod-to-pod TCP is unreliable across k3d nodes on Docker
+# Desktop for Mac (issue #21) -- pods ping each other while connections are
+# refused. One node removes inter-node traffic entirely, which is enough to run
+# the chaos experiments that only need pods and a working API server.
+#
+# What you give up beyond the low-memory profile: nothing that was working
+# anyway. Scheduling across nodes cannot be demonstrated, but it could not be
+# demonstrated reliably before either.
+#
+# Originally derived from the low-memory profile: 1 server, 1 agent.
+#
+# Use when Docker has less than ~5 GiB. Pair it with the matching Terraform
+# variables, which drop Loki, run a single Postgres instance, and shorten
+# Prometheus retention:
+#
+#   make cluster-up PROFILE=lowmem
+#   make bootstrap  PROFILE=lowmem
+#
+# What you give up: no Postgres failover to demonstrate (one instance cannot
+# fail over), no log aggregation, and 6h of metrics history instead of 24h.
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: webhook-relay
+
+servers: 1
+agents: 0
+
+image: docker.io/rancher/k3s:v1.31.4-k3s1
+
+registries:
+  create:
+    name: webhook-relay-registry
+    host: "0.0.0.0"
+    hostPort: "5111"
+  config: |
+    mirrors:
+      "webhook-relay-registry:5000":
+        endpoint:
+          - http://webhook-relay-registry:5000
+
+ports:
+  - port: "8081:80"
+    nodeFilters:
+      - loadbalancer
+  - port: "8443:443"
+    nodeFilters:
+      - loadbalancer
+
+options:
+  k3d:
+    wait: true
+    timeout: "300s"
+  k3s:
+    extraArgs:
+      - arg: --disable=traefik
+        nodeFilters:
+          - server:*
+      - arg: --disable=servicelb
+        nodeFilters:
+          - server:*
+      # host-gw instead of the default VXLAN backend.
+      #
+      # Every k3d "node" is a container on one Docker bridge, so the nodes are
+      # already on a shared L2 segment and encapsulation buys nothing. It also
+      # costs: on Docker Desktop for Mac, flannel's VXLAN traffic is silently
+      # dropped for TCP while ICMP passes, which presents as pods that can ping
+      # each other but cannot open a connection -- a database reporting itself
+      # healthy while every client gets "connection refused".
+      #
+      # host-gw just writes routes, so there is no overlay to misbehave.
+      - arg: --flannel-backend=host-gw
+        nodeFilters:
+          - server:*
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true
+  runtime:
+    # One node runs everything, so it gets what two nodes shared. At 1800m the
+    # ArgoCD pre-install hook fails with "resource quota evaluation timed out"
+    # -- the API server starves under memory pressure and the admission check
+    # never completes, which surfaces as a Helm hook failure rather than as an
+    # OOM anywhere obvious.
+    serversMemory: 4000m

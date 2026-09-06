@@ -8,7 +8,7 @@ locals {
     postgres_instances      = local.lowmem ? 1 : var.postgres_instances
     enable_loki             = local.lowmem ? false : var.enable_loki
     enable_tempo            = var.enable_tempo
-    enable_chaos_mesh       = local.lowmem ? false : var.enable_chaos_mesh
+    enable_chaos_mesh       = local.lowmem ? var.enable_chaos_mesh_in_lowmem : var.enable_chaos_mesh
     prometheus_retention    = local.lowmem ? "6h" : var.prometheus_retention
     prometheus_storage_size = local.lowmem ? "2Gi" : var.prometheus_storage_size
     prometheus_memory       = local.lowmem ? "512Mi" : "1Gi"

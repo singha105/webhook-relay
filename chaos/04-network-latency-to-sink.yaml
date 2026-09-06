@@ -42,7 +42,7 @@ spec:
       namespaces:
         - webhook-relay
       labelSelectors:
-        app: sink
+        app.kubernetes.io/name: webhook-relay-sink
   delay:
     latency: "30s"
     correlation: "0"

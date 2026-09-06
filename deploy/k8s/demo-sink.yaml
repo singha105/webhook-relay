@@ -1,0 +1,87 @@
+# A controllable test receiver for the Kubernetes demo.
+#
+# Not part of the application chart: it is a fixture, and shipping a fake
+# receiver inside the product chart would be a way to accidentally deploy one.
+#
+# The two NetworkPolicies are the interesting part. The namespace runs a
+# default-deny, and the worker's egress policy deliberately excludes every
+# RFC1918 range -- that is SSRF prevention at the network layer, and it means a
+# worker CANNOT deliver to anything inside the cluster. A trusted internal
+# receiver has to be allowed explicitly, which is exactly what a real
+# deployment would do.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-relay-sink
+  labels:
+    app.kubernetes.io/name: webhook-relay-sink
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: webhook-relay-sink
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: webhook-relay-sink
+    spec:
+      containers:
+        - name: sink
+          image: webhook-relay-registry:5000/webhook-sink:dev
+          ports:
+            - containerPort: 9090
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-relay-sink
+  labels:
+    app.kubernetes.io/name: webhook-relay-sink
+spec:
+  selector:
+    app.kubernetes.io/name: webhook-relay-sink
+  ports:
+    - port: 9090
+      targetPort: 9090
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: webhook-relay-sink-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: webhook-relay-sink
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: webhook-relay
+      ports:
+        - protocol: TCP
+          port: 9090
+    # Also allow the port-forward path, so the demo can read /_control/stats.
+    - {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: webhook-relay-worker-egress-demo-sink
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: webhook-relay
+      app.kubernetes.io/component: worker
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: webhook-relay-sink
+      ports:
+        - protocol: TCP
+          port: 9090

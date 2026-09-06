@@ -1,0 +1,27 @@
+  [16:39:32Z] endpoint 3c4e8ad5-a59b-4373-b162-64019e79ee0d
+  [16:39:32Z] injecting 30s latency toward the receiver (client timeout is 10s)
+  [16:39:37Z] posted 40 events
+  [16:40:08Z] t+30s states: delivered=40 consecutive_failures=0
+  [16:40:38Z] t+60s states: delivered=40 consecutive_failures=0
+  [16:41:10Z] t+90s states: delivered=40 consecutive_failures=0
+  [16:41:42Z] t+120s states: delivered=40 consecutive_failures=0
+  [16:42:14Z] t+150s states: delivered=40 consecutive_failures=0
+  [16:42:46Z] t+180s states: delivered=40 consecutive_failures=0
+  [16:43:18Z] t+210s states: delivered=40 consecutive_failures=0
+  [16:43:50Z] t+240s states: delivered=40 consecutive_failures=0
+  [16:44:23Z] t+270s states: delivered=40 consecutive_failures=0
+  [16:44:55Z] t+300s states: delivered=40 consecutive_failures=0
+  [16:44:55Z] removing the latency
+  [16:44:56Z] waiting for recovery
+
+  final: delivered=40
+  attempts recorded:   40
+  timeouts (null code):0
+
+=== RERUN with injection confirmed (AllInjected=True, 3 targets) ===
+  [t+40s] delivered=20 | attempts=20 timeouts=0 cf=0
+  [t+80s] delivered=20 | attempts=20 timeouts=0 cf=0
+  [t+120s] delivered=20 | attempts=20 timeouts=0 cf=0
+  [t+160s] delivered=20 | attempts=20 timeouts=0 cf=0
+  [t+200s] delivered=20 | attempts=20 timeouts=0 cf=0
+  [t+240s] delivered=20 | attempts=20 timeouts=0 cf=0

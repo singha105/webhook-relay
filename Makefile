@@ -33,7 +33,7 @@ GOLANGCI      := $(shell command -v golangci-lint 2>/dev/null)
 
 .PHONY: help
 help: ## Show this help
-	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
+	@grep -hE '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
 # -----------------------------------------------------------------------------
@@ -121,6 +121,10 @@ demo-up: ## Start the stack plus the controllable test sink
 .PHONY: demo
 demo: ## ONE COMMAND: bring the stack up and prove it works end to end
 	@./scripts/demo.sh
+
+.PHONY: demo-k8s
+demo-k8s: ## ONE COMMAND: cluster + ArgoCD + a delivered webhook, on Kubernetes
+	@./scripts/demo-k8s.sh
 
 .PHONY: demo-delivery
 demo-delivery: ## The Day 2 retry/DLQ/replay walkthrough (needs `make demo-up`)

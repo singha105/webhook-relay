@@ -126,6 +126,20 @@ variable "enable_chaos_mesh" {
   default     = true
 }
 
+variable "enable_chaos_mesh_in_lowmem" {
+  description = <<-EOT
+    Install Chaos Mesh even under the lowmem profile.
+
+    Off by default because lowmem exists for machines that are already short of
+    memory, and Chaos Mesh adds a controller, a dashboard and a DaemonSet. It is
+    an explicit opt-in rather than an unconditional disable so the Day 5 chaos
+    experiments can be run on a small machine when that is the point of the
+    exercise.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "prometheus_retention" {
   description = "How long Prometheus keeps samples."
   type        = string
