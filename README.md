@@ -58,6 +58,13 @@ flight** and shows what survives. Takes about five minutes on a cold cache.
 Requires Docker, `curl`, and `jq`. Nothing else — no account, no API key, no
 cloud provider.
 
+For the Kubernetes path — cluster, Terraform, ArgoCD, and a webhook delivered
+in-cluster — use:
+
+```bash
+make demo-k8s
+```
+
 ```bash
 make down          # stop everything, delete the volumes
 make chaos-list    # the chaos experiments and how to run them
@@ -399,19 +406,20 @@ Eleven experiments, each with a prediction and a falsification criterion committ
 | 1 | Kill a worker mid-delivery | Entries are reclaimed; no loss | Covered by #2 |
 | 2 | Same, dedup disabled | Duplicates appear without the guard | ✅ **Correct.** 10 duplicates without, 0 with, over 400 events. Duplicates = in-flight = concurrency = 10 |
 | 3 | Poison message | No payload can wedge a worker | ✅ **Correct.** 10 of 11 hostile payloads delivered, malformed JSON rejected at ingest, 0 restarts |
-| 4 | 30s latency vs 10s timeout | Timeouts, retries, no loss | ⬜ Not run — needs Chaos Mesh |
+| 4 | 30s latency vs 10s timeout | Timeouts, retries, breaker opens, pool recovers | ⚠️ **Inconclusive.** Fault reported as injected across 3 pods; traffic unaffected, 20/20 delivered first attempt |
 | 5 | Kill Valkey | Queue lost, Postgres re-enqueues, no events lost | ✅ **Correct.** 200 posted, 200 delivered, **0 lost**, 0 duplicates. 170 events had their queue entries destroyed mid-flight and all came back |
-| 6 | Kill the Postgres primary | CNPG fails over; writes resume | ⬜ Not run — needs 3 replicas |
-| 7 | Workers to zero for 5 min | Backlog grows, drains on return | ⬜ Not run — needs Chaos Mesh |
-| 8 | Partition worker from Valkey | Worker stalls, recovers | ⬜ Not run — needs Chaos Mesh |
-| 9 | CPU stress on a worker | Throughput drops, no incorrectness | ⬜ Not run — needs Chaos Mesh |
+| 6 | Kill the Postgres primary | CNPG fails over; writes resume | ⬜ Not run — single-node profile runs 1 replica |
+| 7 | Workers to zero for 5 min | Backlog grows, drains on return | ❌ **Partly wrong.** 730 events, **0 lost**, 0 ingest errors — but repeated `pod-kill` is *not* equivalent to scaling to zero: pods restart in seconds and drain in the gaps |
+| 8 | Partition worker from Valkey | Worker stalls, recovers | ⬜ Not run |
+| 9 | CPU stress on a worker | Throughput drops, no incorrectness | ⬜ Not run |
 | 10 | Receiver at the timeout boundary | Double-processing at the receiver | ❌ **Prediction wrong.** At 9.9s vs a 10s timeout: zero timeouts, perfectly clean. I approximated the boundary instead of crossing it. At 10.4s: receiver processed 15 requests, we recorded **0 deliveries** |
 | 11 | What happens to a suppressed event | The guard defers the duplicate rather than preventing it | ✅ **Correct, and it corrects #2.** All 8 in-flight requests duplicated 73s after the kill, once the dedup marker expired |
 
-Five did not run. Chaos Mesh needs ~6 GiB of Docker memory and this machine has
-3.825 GiB, so their manifests and predictions are committed **unresolved**
-rather than given invented results. An experiment log where every prediction was
-confirmed is a log where nothing was learned.
+Three did not run, and one is inconclusive. Their manifests and predictions are
+committed **unresolved** rather than given invented results. An experiment log
+where every prediction was confirmed is a log where nothing was learned — and
+one where a silently-failed injection is written up as a pass is worse than
+useless.
 
 Full predictions and results: [`docs/chaos-results.md`](docs/chaos-results.md) ·
 manifests in [`chaos/`](chaos/)
