@@ -400,7 +400,7 @@ Eleven experiments, each with a prediction and a falsification criterion committ
 | 2 | Same, dedup disabled | Duplicates appear without the guard | ✅ **Correct.** 10 duplicates without, 0 with, over 400 events. Duplicates = in-flight = concurrency = 10 |
 | 3 | Poison message | No payload can wedge a worker | ✅ **Correct.** 10 of 11 hostile payloads delivered, malformed JSON rejected at ingest, 0 restarts |
 | 4 | 30s latency vs 10s timeout | Timeouts, retries, no loss | ⬜ Not run — needs Chaos Mesh |
-| 5 | Kill Valkey | Queue lost, Postgres re-enqueues, no events lost | ⬜ Script committed, not yet run |
+| 5 | Kill Valkey | Queue lost, Postgres re-enqueues, no events lost | ✅ **Correct.** 200 posted, 200 delivered, **0 lost**, 0 duplicates. 170 events had their queue entries destroyed mid-flight and all came back |
 | 6 | Kill the Postgres primary | CNPG fails over; writes resume | ⬜ Not run — needs 3 replicas |
 | 7 | Workers to zero for 5 min | Backlog grows, drains on return | ⬜ Not run — needs Chaos Mesh |
 | 8 | Partition worker from Valkey | Worker stalls, recovers | ⬜ Not run — needs Chaos Mesh |
@@ -506,8 +506,12 @@ Named here rather than left for a reviewer to find.
   semantics](#delivery-semantics).
 - **`payload: null` is accepted** and delivered as the four bytes `null`, since
   it is valid JSON. [#7](https://github.com/singha105/webhook-relay/issues/7)
-- **NetworkPolicies are written but not enforced**, because k3s ships Flannel.
-  They need Calico or Cilium to do anything.
+- **NetworkPolicies were missing a rule for Postgres.** k3s *does* enforce
+  NetworkPolicy — it ships a kube-router-based controller, so an earlier note
+  here claiming Flannel made them inert was wrong. With enforcement working, the
+  namespace default-deny firewalled the database off from the application
+  entirely, because the datastores policy selected only Valkey's labels and
+  CloudNativePG pods carry `cnpg.io/*`. Fixed; found by rebuilding from scratch.
 - **The HPA's queue-depth metric is disabled by default.** It needs
   prometheus-adapter, which is not installed. An HPA referencing a metric nobody
   serves is a silently degraded autoscaler, so it is off rather than aspirational.

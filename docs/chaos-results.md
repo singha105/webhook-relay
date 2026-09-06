@@ -15,8 +15,17 @@ retrofitted to the results.
 | Docker | 3.825 GiB allocated |
 | Environment | docker-compose stack (Postgres 16, Valkey 8, api, worker, sink) |
 
-**The Kubernetes cluster could not host these.** The full profile needs about
-6 GiB and Docker has 3.825, so Chaos Mesh was never installed. Experiments that
+**The Kubernetes cluster still cannot host these, but for a different reason
+than originally recorded.** Docker was raised to 5 GiB and the low-memory
+profile now brings up everything — ArgoCD, Sealed Secrets, CloudNativePG,
+Chaos Mesh and the observability stack all reach `Running`. What does not work
+is pod-to-pod TCP: on Docker Desktop for Mac, pods ping each other while
+connections are refused, so the application itself never serves traffic
+in-cluster. Switching flannel from VXLAN to `host-gw` fixed cross-node TCP in a
+direct test and later regressed.
+
+So the blocker was never only memory. That was the honest reading of the
+evidence at the time, and it was incomplete. Experiments that
 require it are marked NOT RUN below, with their manifests committed and their
 predictions unresolved — a prediction with no result is honest; a result
 invented to match one is not.
