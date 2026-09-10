@@ -1369,6 +1369,16 @@ Six days, one thing at a time, each merged to `main` behind CI and tagged.
 | **5** | k6 load tests, the bottleneck hunt and its fix, chaos experiments, the postmortem |
 | **6** | ADRs, `make demo`, the front door you are reading |
 
+## Author
+
+**Arnab Singh** — M.S. Computer Science, University of Dayton (Dec 2026).
+Building toward DevOps, Cloud/AWS and Platform Engineering.
+
+[GitHub profile](https://github.com/singha105) ·
+[Portfolio](https://singha105.github.io) ·
+[LinkedIn](https://www.linkedin.com/in/singharnab/) ·
+[arnabsingh001@gmail.com](mailto:arnabsingh001@gmail.com)
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
