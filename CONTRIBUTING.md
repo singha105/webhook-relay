@@ -2,7 +2,7 @@
 
 ## Local setup
 
-Docker, Go 1.25+, `curl`, `jq`. Nothing else — no cloud account, no API key.
+Docker, Go 1.26+, `curl`, `jq`. Nothing else — no cloud account, no API key.
 
 ```bash
 git clone https://github.com/singha105/webhook-relay.git
