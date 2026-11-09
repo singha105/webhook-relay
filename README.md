@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/singha105/webhook-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/singha105/webhook-relay/actions/workflows/ci.yml)
 [![Coverage](docs/coverage/badge.svg)](docs/coverage/README.md)
-[![Go](https://img.shields.io/badge/go-1.25-00ADD8?logo=go&logoColor=white)](go.mod)
+[![Go](https://img.shields.io/badge/go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A webhook delivery service — the thing that sits between your application and
